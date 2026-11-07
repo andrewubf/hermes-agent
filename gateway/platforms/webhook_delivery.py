@@ -28,6 +28,10 @@ def route_digest(adapter, chat_id):
     route = adapter._routes.get(route_name)
     if route is None:
         raise RuntimeStoreError('not_found')
+    try:
+        validate_bot_chat_route(route)
+    except ValueError:
+        raise RuntimeStoreError('invalid_params') from None
     return hashlib.sha256(json.dumps(route, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 

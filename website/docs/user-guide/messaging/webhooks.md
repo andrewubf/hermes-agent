@@ -341,6 +341,7 @@ The `deliver` field controls where the agent's response goes after processing th
 | Deliver Type | Description |
 |-------------|-------------|
 | `log` | Logs the response to the gateway log output. This is the default and is useful for testing. |
+| `bot-chat` | Sends the completed text final to the same effective profile's canonical Bot Chat as an automation turn. See [Bot Chat delivery](#bot-chat-delivery). |
 | `github_comment` | Posts the response as a PR/issue comment via the `gh` CLI. Requires `deliver_extra.repo` and `deliver_extra.pr_number`. The `gh` CLI must be installed and authenticated on the gateway host (`gh auth login`). |
 | `telegram` | Routes the response to Telegram. Uses the home channel, or specify `chat_id` in `deliver_extra`. |
 | `discord` | Routes the response to Discord. Uses the home channel, or specify `chat_id` in `deliver_extra`. |
@@ -359,6 +360,48 @@ The `deliver` field controls where the agent's response goes after processing th
 | `bluebubbles` | Routes the response to BlueBubbles (iMessage). Uses the home channel, or specify `chat_id` in `deliver_extra`. |
 
 For cross-platform delivery, the target platform must also be enabled and connected in the gateway. If no `chat_id` is provided in `deliver_extra`, the response is sent to that platform's configured home channel.
+
+### Bot Chat delivery {#bot-chat-delivery}
+
+```bash
+hermes webhook subscribe build-review --route-profile coder \
+  --deliver bot-chat --prompt 'Review this build: {payload}'
+```
+
+Use `--route-profile` when binding a multiplexed route, then POST to
+`/p/coder/webhooks/build-review`. In standalone mode omit that option and use the
+profile's own subscription file and endpoint. In either mode the event runs in a
+separate webhook session, and its completed final goes only to the canonical Bot
+Chat in the **same admitted effective home**. A bare route routed by profile
+configuration follows its actual admitted home, not necessarily the launch profile.
+Bot Chat then runs its own automation turn, which can invoke a model and incur
+additional cost. The original event prompt is not run inside Bot Chat.
+
+The handoff labels the scrubbed result as webhook automation, not a user message,
+and asks the receiving agent to review, act if needed, and summarize. A silent
+source result is suppressed; the receiving turn can also choose silence. Only
+text finals are supported: media-bearing finals are refused, not forwarded as
+attachments. Background follow-ups and direct or consumed-hook replies are not
+original finals and are refused. `deliver_only`, `coalesce`, `cron_job`,
+`mirror_to_session`, `deliver_extra`, an explicit chat ID, and `bot-chat:<profile>`
+are incompatible. Use another destination for those modes or targets.
+
+An HTTP `202` acknowledges source admission, not a completed investigation or
+Bot Chat delivery. A native `queued` or `claimed` receipt is not settlement;
+`settled` means the receiving turn completed. The stable result delivery ID is
+derived from the admitted source identity and owning home, not the provider's
+HTTP delivery ID. Native receipt records are observational in the effective
+home's `runtime/bot_live_delivery/<result-delivery-id>.json`; their status and
+IDs must not be treated as authorization or as proof that an external action
+succeeded. The source delivery log includes the native result ID and status.
+
+At gateway startup and when a profile is hot-served, delivery-only recovery
+rechecks committed original completed webhook results, including closed source
+sessions, against current route authorization. It observes an existing receipt
+before retrying the same ID. It does not rerun the source investigation, recover
+an uncommitted or interrupted source result, or guarantee retry while the owner
+is unavailable. An unavailable handoff can be retried at a later recovery;
+there is no periodic delivery retry guarantee.
 
 ### Replying to a delivery {#replying-to-a-delivery}
 
