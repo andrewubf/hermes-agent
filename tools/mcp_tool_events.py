@@ -414,6 +414,12 @@ def _subscribe_args_error(args: dict) -> Optional[str]:
     for key in ("deliver", "deliver_chat_id"):
         if args.get(key) is not None and not isinstance(args[key], str):
             return f"'{key}' must be a string"
+    from gateway.platforms.webhook_delivery import validate_bot_chat_route
+    try:
+        validate_bot_chat_route({'deliver': args.get('deliver'),
+                                 'deliver_extra': {'chat_id': args['deliver_chat_id']} if args.get('deliver_chat_id') else {}})
+    except ValueError as exc:
+        return str(exc)
     return None
 
 

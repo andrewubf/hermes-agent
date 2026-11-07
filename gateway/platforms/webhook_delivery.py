@@ -6,6 +6,18 @@ import json
 from hermes_state_runtime import RuntimeStoreError
 
 
+def validate_bot_chat_route(route):
+    """Refuse unsupported webhook Bot Chat addressing and execution modes."""
+    target = route.get('deliver')
+    if not isinstance(target, str) or not (target == 'bot-chat' or target.startswith('bot-chat:')):
+        return
+    if target != 'bot-chat':
+        raise ValueError('bot-chat only supports the route profile, not an explicit target')
+    for field in ('deliver_only', 'coalesce', 'cron_job', 'mirror_to_session', 'deliver_extra'):
+        if route.get(field):
+            raise ValueError(f'bot-chat does not support {field}')
+
+
 def route_digest(adapter, chat_id):
     from gateway.platforms.webhook import _WebhookDeliveryIdentity
     adapter._reload_dynamic_routes()

@@ -176,10 +176,32 @@ def webhook_command(args):
         return handler(args)
 
 
+def _bot_chat_route_options(args):
+    return {
+        'deliver': args.deliver or 'log',
+        'deliver_only': getattr(args, 'deliver_only', False),
+        'cron_job': getattr(args, 'cron_job', ''),
+        'mirror_to_session': getattr(args, 'mirror_to_session', False),
+        'deliver_extra': {'chat_id': args.deliver_chat_id} if args.deliver_chat_id else {},
+    }
+
+
+def _set_route_mirror(route, args):
+    if getattr(args, "mirror_to_session", False):
+        route["mirror_to_session"] = True
+
+
 def _cmd_subscribe(args):
     name = args.name.strip().lower().replace(" ", "-")
     if not re.match(r'^[a-z0-9][a-z0-9_-]*$', name):
         print(f"Error: Invalid name '{name}'. Use lowercase alphanumeric with hyphens/underscores.")
+        return 1
+
+    from gateway.platforms.webhook_delivery import validate_bot_chat_route
+    try:
+        validate_bot_chat_route(_bot_chat_route_options(args))
+    except ValueError as exc:
+        print(f"Error: {exc}")
         return 1
 
     subs = _load_subscriptions()
@@ -235,8 +257,7 @@ def _cmd_subscribe(args):
                 "(telegram, discord, slack, github_comment, etc.) — not 'log'.")
             return 1
         route["deliver_only"] = True
-    if getattr(args, "mirror_to_session", False):
-        route["mirror_to_session"] = True
+    _set_route_mirror(route, args)
     cron_job = (getattr(args, "cron_job", "") or "").strip()
     if cron_job:
         # Validate the reference up-front so a typo surfaces here, not on the first inbound event.
