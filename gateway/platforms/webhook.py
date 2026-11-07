@@ -336,6 +336,8 @@ class WebhookAdapter(BasePlatformAdapter):
 
     async def _deliver_to(self, delivery: dict[str, Any], chat_id: str, content: str) -> SendResult:
         deliver_type = delivery["deliver"]
+        if deliver_type == "bot-chat":
+            return SendResult(success=False, error="Bot Chat requires the original committed webhook final")
         if deliver_type == "log":
             logger.info("[webhook] Response for %s: %s", chat_id, content[:200])
             return SendResult(success=True)
