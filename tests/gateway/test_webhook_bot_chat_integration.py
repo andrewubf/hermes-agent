@@ -49,7 +49,7 @@ def rows(home):
 
 
 @pytest.mark.platforms('linux')
-@pytest.mark.parametrize('mode', ['standalone', 'named-standalone', 'multiplex', 'multiplex-bare'])
+@pytest.mark.parametrize('mode', ['standalone', 'named-standalone', 'multiplex', 'multiplex-bare', 'multiplex-dynamic'])
 def test_authenticated_webhook_receipt_through_real_owner(tmp_path, monkeypatch, mode):
     from gateway.platforms.webhook_bot_chat import result_id
     from tools.bot_live_delivery import read_delivery_result
@@ -85,7 +85,20 @@ def test_authenticated_webhook_receipt_through_real_owner(tmp_path, monkeypatch,
     (home / 'config.yaml').write_text(json.dumps(cfg))
     if mode.startswith('multiplex'):
         cfg['gateway'] = {'multiplex_profiles': True}
-        if mode == 'multiplex':
+        if mode == 'multiplex-dynamic':
+            from argparse import Namespace
+            from hermes_cli.webhook import _cmd_subscribe
+            monkeypatch.setenv('HERMES_HOME', str(launch))
+            args = Namespace(name='fixture', prompt='{text}', events='', description='', skills='',
+                             deliver='bot-chat', deliver_chat_id='', secret='owned-secret',
+                             route_profile='secondary', script='', cron_job='', deliver_only=False,
+                             mirror_to_session=False)
+            assert _cmd_subscribe(args) != 1
+            assert (launch / 'webhook_subscriptions.json').exists()
+            assert not (home / 'webhook_subscriptions.json').exists()
+            cfg['platforms']['webhook']['extra']['routes'] = {}
+            monkeypatch.setenv('HERMES_HOME', str(home))
+        elif mode == 'multiplex':
             cfg['platforms']['webhook']['extra']['routes']['fixture']['profile'] = 'secondary'
         else:
             cfg['gateway']['profile_routes'] = [{'name': 'fixture-secondary', 'platform': 'webhook',
@@ -95,7 +108,9 @@ def test_authenticated_webhook_receipt_through_real_owner(tmp_path, monkeypatch,
                                                      'terminal': {'cwd': str(home)}, 'platform_toolsets': {'gui': []}}))
     env = child_env() | {'HOME': str(user), 'USERPROFILE': str(user), 'HERMES_HOME': str(launch),
                          'PYTHONPATH': str(root), 'OPENAI_API_KEY': 'loopback-only', 'OPENAI_BASE_URL': base,
-                         'PYTHONUNBUFFERED': '1', 'XDG_RUNTIME_DIR': '/proc/self/cwd/runtime'}
+                         'PYTHONUNBUFFERED': '1', 'XDG_RUNTIME_DIR': '/proc/self/cwd/runtime',
+                         'HTTP_PROXY': 'http://127.0.0.1:1', 'HTTPS_PROXY': 'http://127.0.0.1:1',
+                         'NO_PROXY': '127.0.0.1,localhost'}
 
     async def scenario(desc):
         if mode.startswith('multiplex'):
@@ -115,7 +130,7 @@ def test_authenticated_webhook_receipt_through_real_owner(tmp_path, monkeypatch,
             held = await rpc(ws, 'prompt.submit', session_id=sid, input_id='held', text='BLOCK_STARTED')
             assert 'result' in held, held
             assert await asyncio.to_thread(peer.blocked.wait, 30)
-            prefix = '/p/secondary' if mode == 'multiplex' else ''
+            prefix = '/p/secondary' if mode in ('multiplex', 'multiplex-dynamic') else ''
             url = f'http://127.0.0.1:{port}{prefix}/webhooks/fixture'
 
             async def post(event, text, signature=True):

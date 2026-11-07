@@ -382,7 +382,11 @@ and asks the receiving agent to review, act if needed, and summarize. A silent
 source result is suppressed; the receiving turn can also choose silence. Only
 text finals are supported: media-bearing finals are refused, not forwarded as
 attachments. Background follow-ups and direct or consumed-hook replies are not
-original finals and are refused. `deliver_only`, `coalesce`, `cron_job`,
+original finals and are refused. When a hook consumes an event and supplies a reply,
+HTTP `202` acknowledges hook consumption, not source admission or delivery. The gateway
+logs a refusal with `event_ref` (the first 16 hexadecimal characters of the SHA-256
+of the delivery ID); it does not log the reply. Do not blindly retry the consumed hook.
+`deliver_only`, `coalesce`, `cron_job`,
 `mirror_to_session`, `deliver_extra`, an explicit chat ID, and `bot-chat:<profile>`
 are incompatible. Use another destination for those modes or targets.
 
