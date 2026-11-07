@@ -49,13 +49,16 @@ def rows(home):
 
 
 @pytest.mark.platforms('linux')
-def test_authenticated_webhook_receipt_through_real_owner(tmp_path, monkeypatch):
+@pytest.mark.parametrize('mode', ['standalone', 'named-standalone', 'multiplex', 'multiplex-bare'])
+def test_authenticated_webhook_receipt_through_real_owner(tmp_path, monkeypatch, mode):
     from gateway.platforms.webhook_bot_chat import result_id
     from tools.bot_live_delivery import read_delivery_result
 
     root = Path(__file__).resolve().parents[2]
-    home, user = tmp_path / 'state', tmp_path / 'user'
-    home.mkdir(mode=0o700)
+    home = tmp_path / 'state' / 'profiles' / 'secondary' if mode != 'standalone' else tmp_path / 'state'
+    launch = tmp_path / 'state' if mode.startswith('multiplex') else home
+    user = tmp_path / 'user'
+    home.mkdir(mode=0o700, parents=True)
     user.mkdir(mode=0o700)
     # Both processes use this private cwd, giving the Unix socket a short spelling.
     runtime = tmp_path / 'runtime'
@@ -74,18 +77,35 @@ def test_authenticated_webhook_receipt_through_real_owner(tmp_path, monkeypatch)
         port = sock.getsockname()[1]
     base = f'http://127.0.0.1:{peer.server_port}/v1'
     cfg = {'model': {'provider': 'custom', 'default': 'local-wire-stub', 'base_url': base},
-           'gateway': {'multiplex_profiles': False},
+           'gateway': {'standalone': True},
            'platforms': {'webhook': {'enabled': True, 'extra': {'host': '127.0.0.1', 'port': port,
                'secret': 'owned-secret', 'routes': {'fixture': {'prompt': '{text}', 'deliver': 'bot-chat'}}}}},
            'auxiliary': {'title_generation': {'enabled': False}}, 'terminal': {'cwd': str(home)},
            'streaming': {'enabled': False}, 'platform_toolsets': {'gui': []}}
     (home / 'config.yaml').write_text(json.dumps(cfg))
-    env = child_env() | {'HOME': str(user), 'USERPROFILE': str(user), 'HERMES_HOME': str(home),
+    if mode.startswith('multiplex'):
+        cfg['gateway'] = {'multiplex_profiles': True}
+        if mode == 'multiplex':
+            cfg['platforms']['webhook']['extra']['routes']['fixture']['profile'] = 'secondary'
+        else:
+            cfg['gateway']['profile_routes'] = [{'name': 'fixture-secondary', 'platform': 'webhook',
+                                                  'user_id': 'webhook:fixture', 'profile': 'secondary'}]
+        (launch / 'config.yaml').write_text(json.dumps(cfg))
+        (home / 'config.yaml').write_text(json.dumps({'model': cfg['model'], 'auxiliary': cfg['auxiliary'],
+                                                     'terminal': {'cwd': str(home)}, 'platform_toolsets': {'gui': []}}))
+    env = child_env() | {'HOME': str(user), 'USERPROFILE': str(user), 'HERMES_HOME': str(launch),
                          'PYTHONPATH': str(root), 'OPENAI_API_KEY': 'loopback-only', 'OPENAI_BASE_URL': base,
                          'PYTHONUNBUFFERED': '1', 'XDG_RUNTIME_DIR': '/proc/self/cwd/runtime'}
 
     async def scenario(desc):
-        async with websocket(home, desc) as ws, aiohttp.ClientSession() as client:
+        if mode.startswith('multiplex'):
+            async with websocket(launch, desc) as default_ws:
+                sentinel = await rpc(default_ws, 'session.create', request_id='default-target', source='gui', cwd=str(launch), toolsets=[])
+                sentinel_id = sentinel['result']['session_id']
+                renamed = await rpc(default_ws, 'session.mutate', session_id=sentinel_id, request_id='default-title',
+                                    expected_revision=sentinel['result']['revision'], operation='rename', payload={'title': 'Bot Chat'})
+                assert 'result' in renamed, renamed
+        async with websocket(home, desc, control_home=launch) as ws, aiohttp.ClientSession() as client:
             created = await rpc(ws, 'session.create', request_id='target', source='gui', cwd=str(home), toolsets=[])
             assert 'result' in created, created
             sid = created['result']['session_id']
@@ -95,7 +115,8 @@ def test_authenticated_webhook_receipt_through_real_owner(tmp_path, monkeypatch)
             held = await rpc(ws, 'prompt.submit', session_id=sid, input_id='held', text='BLOCK_STARTED')
             assert 'result' in held, held
             assert await asyncio.to_thread(peer.blocked.wait, 30)
-            url = f'http://127.0.0.1:{port}/webhooks/fixture'
+            prefix = '/p/secondary' if mode == 'multiplex' else ''
+            url = f'http://127.0.0.1:{port}{prefix}/webhooks/fixture'
 
             async def post(event, text, signature=True):
                 body = json.dumps({'text': text}).encode()
@@ -137,6 +158,11 @@ def test_authenticated_webhook_receipt_through_real_owner(tmp_path, monkeypatch)
             all_rows = rows(home)
             assert len([r for r in all_rows if r['request_id'] in ('event-one', 'event-two')]) == 2
             assert len([r for r in all_rows if r['request_id'].startswith('bot:')]) == 2
+            if mode.startswith('multiplex'):
+                assert rows(launch) == []
+                assert sid != sentinel_id
+                assert settled['profile_home'] == str(home)
+                assert read_delivery_result(launch, key) is None
             inputs = [next((m.get('content', '') for m in reversed(req['messages']) if m['role'] == 'user'), '') for req in peer.requests if req.get('messages')]
             assert inputs.count('SOURCE_PRIVATE_PROMPT') == 2
             wrapped = [text for text in inputs if isinstance(text, str) and 'Webhook automation' in text]
@@ -146,13 +172,13 @@ def test_authenticated_webhook_receipt_through_real_owner(tmp_path, monkeypatch)
                               'queued': queued, 'settled': settled, 'second_key': key2, 'inputs': inputs}))
 
     try:
-        with daemon(tmp_path, home, env, barrier=False) as (_, desc):
+        with daemon(tmp_path, launch, env, barrier=False) as (_, desc):
             try:
                 asyncio.run(scenario(desc))
             except BaseException:
                 print('DIAGNOSTIC ROWS', json.dumps(rows(home)))
                 print('DIAGNOSTIC MODEL', json.dumps(peer.requests))
-                print('DIAGNOSTIC LOG', (home / 'restart.log').read_text())
+                print('DIAGNOSTIC LOG', (launch / 'restart.log').read_text())
                 raise
     finally:
         peer.release.set()
