@@ -27,7 +27,7 @@ def _handoff(home, admission_id, route, content):
     key = result_id(home, admission_id)
     receipt = read_delivery_result(home, key)
     if receipt is None:
-        message = (f'[Webhook automation "{_scrub(route)}" output — not the user. '
+        message = (f'[Webhook automation "{_scrub(route)}" output: not the user. '
                    f'Review it, act on anything that needs action, and summarize for the chat.]\n\n{_scrub(content)}')
         owner = find_canonical_live_owner(home)
         if owner is None:
