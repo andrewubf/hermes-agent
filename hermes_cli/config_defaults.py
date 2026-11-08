@@ -1376,6 +1376,16 @@ DEFAULT_CONFIG = {
         # notifications to the PARENT; false suppresses them (the child's result is the
         # deliverable). Async-delegation results are NEVER suppressed.
         "surface_child_process_notifications": False,
+        # Image routing for delegated children: "auto" = the child's own model decides (a
+        # vision-capable child gets image_url parts even when the MAIN conversation pins
+        # auxiliary.vision) with an explicit agent.image_input_mode pin inherited; "native"/"text"
+        # pin the child. In auto, children on text-only models stay on the text lane.
+        "image_input_mode": "auto",
+        # Image routing for delegated children: "auto" = the child's own model decides (a
+        # vision-capable child gets image_url parts even when the MAIN conversation pins
+        # auxiliary.vision) with an explicit agent.image_input_mode pin inherited; "native"/"text"
+        # pin the child. In auto, children on text-only models stay on the text lane.
+        "image_input_mode": "auto",
     },
     # Ephemeral prefill messages file — JSON list of {role, content} dicts injected at the start of
     # every API call for few-shot priming. Never saved to sessions/logs/trajectories.
