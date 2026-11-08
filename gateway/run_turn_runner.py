@@ -183,6 +183,19 @@ def _resolution_failure_reply(exc: Exception, platform: Platform) -> tuple[str, 
     return t("gateway.errors.no_credentials"), auth_permanent, False
 
 
+
+def _observed_turn_persist_message(run_message, override, live_text):
+    """The durable user row for an observed-group turn: the clean text, or for a native image turn the
+    pre-wrap content-part list (a str override cannot replace list content, so the wrapped list would be
+    persisted and re-wrapped every turn). A clean override still swaps the live text's leading copy."""
+    if not isinstance(run_message, list):
+        return override if override is not None else live_text
+    first = run_message[0] if run_message else None
+    if (isinstance(override, str) and isinstance(first, dict) and first.get("type") == "text"
+            and isinstance(live_text, str) and str(first.get("text", "")).startswith(live_text)):
+        return [{**first, "text": override + first["text"][len(live_text):]}, *run_message[1:]]
+    return run_message
+
 class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
     """Per-turn collaborator carrying ``GatewayRunner._run_agent_inner``'s tool-progress callbacks."""
 
@@ -985,7 +998,8 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         token = set_current_session_key(session_key)
         register_gateway_notify(session_key, self._approval_notify_sync)
         try:
-            api_message = _wrap_current_message_with_observed_context(self._native_image_run_message(), observed_group_context)
+            run_message = self._native_image_run_message()
+            api_message = _wrap_current_message_with_observed_context(run_message, observed_group_context)
             kwargs = {"conversation_history": agent_history, "task_id": ctx.session_id}
             from gateway.session_api_turn import api_execution
             api = api_execution.get()
@@ -999,10 +1013,12 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                                                "is_bot": bool(getattr(ctx.source, "is_bot", False))})
             if ctx.title_user_message is not None:
                 kwargs["title_user_message"] = ctx.title_user_message
-            if persist_user_message_override is not None:
+            if observed_group_context:
+                # The observed wrapper is API-only: persist the PRE-wrap turn (#137627).
+                kwargs["persist_user_message"] = _observed_turn_persist_message(
+                    run_message, persist_user_message_override, ctx.message)
+            elif persist_user_message_override is not None:
                 kwargs["persist_user_message"] = persist_user_message_override
-            elif observed_group_context:
-                kwargs["persist_user_message"] = ctx.message
             if ctx.persist_user_display_kind:
                 # Internal self-injected turn: type the persisted user row so UIs render it as a
                 # timeline notice, not a user bubble (stripped from provider payloads downstream).
