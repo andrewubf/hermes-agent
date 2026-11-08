@@ -100,3 +100,28 @@ class TelegramTopicRoutingMixin:
         logger.info("[%s] Thread-less message %s adopted by new Telegram topic %s (chat=%s)",
                     self.name, getattr(message, "message_id", "?"), created_thread_id, key[0])
         return created_thread_id
+
+    def configured_channels(self) -> list[dict[str, Any]]:
+        """Channel-directory targets from ``extra.dm_topics`` / ``extra.group_topics`` that carry a thread_id,
+        so configured topics stay sendable after their sessions are pruned (#52629). A topic name used in
+        more than one chat is qualified with its chat id so a by-name send cannot pick the wrong chat."""
+        group_topics = self.config.extra.get("group_topics") or []
+        if isinstance(group_topics, dict):
+            group_topics = [{"chat_id": cid, "topics": topics} for cid, topics in group_topics.items()]
+        rows = [(entry, "dm") for entry in self._dm_topics_config or ()] + [(entry, "group") for entry in group_topics]
+        found = []
+        for entry, kind in rows:
+            chat_id = entry.get("chat_id") if isinstance(entry, dict) else None
+            for topic in (entry.get("topics") or []) if chat_id is not None else ():
+                if isinstance(topic, dict) and topic.get("thread_id"):  # group-topic ``name`` is optional
+                    tid = str(topic["thread_id"])
+                    found.append((str(chat_id), tid, str(topic.get("name") or f"{chat_id} / topic {tid}"), kind))
+
+        def _match_key(name: str) -> str:  # resolve_channel_name's normalisation: a "#x" label resolves as "x"
+            return name.lstrip("#").strip().lower()
+        chats_per_name: dict[str, set] = {}
+        for chat_id, _tid, name, _kind in found:
+            chats_per_name.setdefault(_match_key(name), set()).add(chat_id)
+        return [{"id": f"{chat_id}:{tid}", "thread_id": tid, "type": kind,
+                 "name": name if len(chats_per_name[_match_key(name)]) == 1 else f"{chat_id} / {name}"}
+                for chat_id, tid, name, kind in found]

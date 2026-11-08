@@ -2629,8 +2629,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             logger.warning("[%s] Failed to persist thread_id to config: %s", self.name, e, exc_info=True)
 
     async def _setup_dm_topics(self) -> None:
-        """Load or create configured DM topics: ``extra['dm_topics']`` is ``[{"chat_id", "topics": [{"name",
-        "icon_color", "thread_id"?, "skill"?}]}]``; persisted thread_ids are cached without an API call."""
+        """Load or create ``extra['dm_topics']`` (``[{"chat_id", "topics": [{"name", "thread_id"?, ...}]}]``). Re-reads
+        config.yaml first: a rebuilt adapter's boot-time snapshot predates the persisted thread_ids (#132522)."""
+        self._reload_dm_topics_from_config()
         for chat_entry in self._dm_topics_config or ():
             chat_id = chat_entry.get("chat_id")
             topics = chat_entry.get("topics", [])
@@ -2642,7 +2643,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 if not topic_name:
                     continue
                 cache_key = f"{chat_id}:{topic_name}"
-                existing_thread_id = topic_conf.get("thread_id")
+                existing_thread_id = topic_conf.get("thread_id") or self._dm_topics.get(cache_key)  # unsaved id
                 if existing_thread_id:
                     self._dm_topics[cache_key] = int(existing_thread_id)
                     logger.info("[%s] DM topic loaded from config: %s -> thread_id=%s", self.name, cache_key, existing_thread_id)
@@ -2652,8 +2653,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                     icon_custom_emoji_id=topic_conf.get("icon_custom_emoji_id"))
                 if not thread_id:
                     continue
-                self._dm_topics[cache_key] = thread_id
-                logger.info("[%s] DM topic cached: %s -> thread_id=%s", self.name, cache_key, thread_id)
+                self._dm_topics[cache_key] = topic_conf["thread_id"] = thread_id  # a same-process reconnect reuses it
                 self._persist_dm_topic_thread_id(int(chat_id), topic_name, thread_id)
                 # Seed message: Telegram's client hides empty topics until they contain one.
                 try:
@@ -6931,8 +6931,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
     def _reload_dm_topics_from_config(self) -> None:
         """Re-read dm_topics from config.yaml so externally created topics work without restart."""
         try:
-            from hermes_cli.config import load_config_readonly  # canonical loader: managed overlay + ${VAR}
-            dm_topics = load_config_readonly().get("platforms", {}).get("telegram", {}).get("extra", {}).get("dm_topics", [])
+            from hermes_cli.config import load_config  # deep-copied: _setup_dm_topics writes thread_ids into it
+            dm_topics = load_config().get("platforms", {}).get("telegram", {}).get("extra", {}).get("dm_topics", [])
             if not dm_topics:
                 self._dm_topics_config = []
                 self._dm_topic_chat_ids = set()
