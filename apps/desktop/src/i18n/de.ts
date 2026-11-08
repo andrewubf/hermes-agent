@@ -5225,6 +5225,7 @@ export const deOverrides = {
       skillActivity: {
         loading: 'Skill wird geladen',
         loaded: 'Skill geladen',
+        unchanged: 'Skill unverändert',
         loadFailed: 'Skill konnte nicht geladen werden',
         readingResource: 'Skill-Ressource wird gelesen',
         readResource: 'Skill-Ressource gelesen',
