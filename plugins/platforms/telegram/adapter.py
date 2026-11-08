@@ -186,7 +186,10 @@ from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id, 
 from plugins.platforms.telegram.telegram_resolved_prompt import edit_keeping_prompt
 from plugins.platforms.telegram.telegram_topic_transfer import TopicTransferFn, apply_root_dm_topic_transfer
 from plugins.platforms.telegram.telegram_network import (
-    SEED_FALLBACK_IPS, TelegramFallbackTransport, discover_fallback_ips, parse_fallback_ip_env, tcp_keepalive_socket_options)
+    SEED_FALLBACK_IPS, TelegramFallbackTransport, build_ptb_requests, discover_fallback_ips, parse_fallback_ip_env,
+    proxy_target_hosts)
+from plugins.platforms.telegram.telegram_outbound import is_visually_empty, resolve_notifications_mode
+from plugins.platforms.telegram.telegram_send_errors import is_entity_parse_error
 from plugins.platforms.telegram.telegram_topic_routing import TelegramTopicRoutingMixin
 from utils import env_float, env_int
 
@@ -2945,47 +2948,6 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
     async def _build_ptb_requests(self) -> tuple:
         """Build the (general, getUpdates) HTTPXRequest pair: fallback-IP transport, explicit proxy, or
         direct DNS; the getUpdates request is instrumented for polling-progress tracking."""
-        # PTB's pool_timeout=1s default trips "Pool timeout" on flaky networks; safer defaults + env overrides.
-        request_kwargs = {
-            "connection_pool_size": env_int("HERMES_TELEGRAM_HTTP_POOL_SIZE", 512),
-            "pool_timeout": env_float("HERMES_TELEGRAM_HTTP_POOL_TIMEOUT", 8.0),
-            "connect_timeout": env_float("HERMES_TELEGRAM_HTTP_CONNECT_TIMEOUT", 10.0),
-            "read_timeout": env_float("HERMES_TELEGRAM_HTTP_READ_TIMEOUT", 20.0),
-            "write_timeout": env_float("HERMES_TELEGRAM_HTTP_WRITE_TIMEOUT", 20.0),
-            # PTB routes file requests to media_write_timeout; httpx budgets it per socket write (stall
-            # tolerance, not bandwidth), so 60s rides out congested-link buffer stalls.
-            "media_write_timeout": 60.0,
-        }
-        # CLOSE_WAIT fd leak: PTB's httpx.AsyncClient has no keepalive tuning; inject platform_httpx_limits()
-        # while preserving PTB's max_connections (httpx_kwargs is spread last, so `limits` here wins).
-        # CLOSE_WAIT fd leak (#31599, same class as #18451): PTB's HTTPXRequest builds the underlying
-        # httpx.AsyncClient with `limits = httpx.Limits(max_connections=connection_pool_size)` and *no*
-        # keepalive tuning, so httpx's default keepalive_expiry=5.0 applies. Behind an HTTP proxy
-        # (Cloudflare Warp etc.) a peer-initiated FIN can sit in CLOSE_WAIT longer than that, leaking fds in
-        # the general request pool (_request[1]) which _drain_polling_connections never resets.
-        from gateway.platforms._http_client_limits import platform_httpx_limits
-        _base_limits = platform_httpx_limits()
-        if _base_limits is not None:
-            import httpx as _httpx
-            _pool_limits = _httpx.Limits(
-                max_connections=request_kwargs["connection_pool_size"],
-                max_keepalive_connections=_base_limits.max_keepalive_connections, keepalive_expiry=_base_limits.keepalive_expiry)
-            # A long-poll is continuously active, so keepalive expiry can't protect it from a server-side
-            # close: never hand getUpdates a pooled socket from a previous poll.
-            _updates_limits = _httpx.Limits(
-                max_connections=request_kwargs["connection_pool_size"], max_keepalive_connections=0,
-                keepalive_expiry=_base_limits.keepalive_expiry)
-        else:  # pragma: no cover — httpx always present alongside PTB
-            _pool_limits = _updates_limits = None
-
-        def _with_limits(httpx_kwargs: Optional[dict] = None) -> dict:
-            """Merge tuned limits into httpx client kwargs (proxy/direct branches only; the fallback-IP
-            branch must pass limits straight into the transport — httpx ignores client `limits` then)."""
-            kwargs = dict(httpx_kwargs or {})
-            if _pool_limits is not None and "limits" not in kwargs:
-                kwargs["limits"] = _pool_limits
-            return kwargs
-
         disable_fallback = os.getenv("HERMES_TELEGRAM_DISABLE_FALLBACK_IPS", "").strip().lower() in {"1", "true", "yes", "on"}
         fallback_ips = [] if disable_fallback else self._fallback_ips()
         if not fallback_ips and not disable_fallback:
@@ -3002,37 +2964,17 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             else:
                 logger.info("[%s] Auto-discovered Telegram fallback IPs: %s", self.name, ", ".join(fallback_ips))
         proxy_url = resolve_proxy_url(
-            "TELEGRAM_PROXY", target_hosts=["api.telegram.org", *fallback_ips],
+            "TELEGRAM_PROXY", target_hosts=proxy_target_hosts(self.config.extra.get("base_url"), fallback_ips),
             configured=self.config.extra.get("proxy_url"))
 
-        def _pair(general_httpx: dict, updates_httpx: dict, **extra) -> tuple:
-            return (HTTPXRequest(**request_kwargs, **extra, httpx_kwargs={"verify": platform_ssl_context(), **general_httpx}),
-                    HTTPXRequest(**request_kwargs, **extra, httpx_kwargs={"verify": platform_ssl_context(), **updates_httpx}))
-
-        if fallback_ips and not proxy_url and not disable_fallback:
+        if fallback_ips and not proxy_url:
             logger.info("[%s] Telegram fallback IPs active: %s", self.name, ", ".join(fallback_ips))
-            _transport_kwargs: dict = {"socket_options": tcp_keepalive_socket_options(), "verify": platform_ssl_context()}
-            # Keep request/update pools separate to reduce contention during polling reconnect + bot API
-            # bootstrap/delete_webhook calls. httpx ignores the client-level `limits` kwarg when a custom
-            # `transport` is supplied (#58790). Unlike the proxy/direct branches (which inject limits at the
-            # client level via `_with_limits`), this branch MUST pass the tuned limits directly into
-            # TelegramFallbackTransport so its inner AsyncHTTPTransport instances honour keepalive_expiry —
-            # do not route this through `_with_limits`, httpx would discard it.
-            if _pool_limits is not None:
-                _transport_kwargs["limits"] = _pool_limits
-            _updates_transport_kwargs = dict(_transport_kwargs)
-            if _updates_limits is not None:
-                _updates_transport_kwargs["limits"] = _updates_limits
-            request, get_updates_request = _pair(
-                {"transport": TelegramFallbackTransport(fallback_ips, **_transport_kwargs)},
-                {"transport": TelegramFallbackTransport(fallback_ips, **_updates_transport_kwargs)})
         elif proxy_url:
             logger.info("[%s] Proxy detected; passing explicitly to HTTPXRequest: %s", self.name, proxy_url)
-            request, get_updates_request = _pair(_with_limits(), {"limits": _updates_limits}, proxy=proxy_url)
-        else:
-            if disable_fallback:
-                logger.info("[%s] Telegram fallback-IP transport disabled via env", self.name)
-            request, get_updates_request = _pair(_with_limits(), {"limits": _updates_limits})
+        elif disable_fallback:
+            logger.info("[%s] Telegram fallback-IP transport disabled via env", self.name)
+        request, get_updates_request = build_ptb_requests(
+            HTTPXRequest, fallback_ips=fallback_ips, proxy_url=proxy_url, verify=platform_ssl_context())
         return request, self._instrument_polling_request(get_updates_request)
 
     async def _initialize_app_with_retries(self, builder) -> None:
@@ -3480,18 +3422,17 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         return _NetErr, _BadReq, _TimedOut
 
     async def _send_chunk_markdown_or_plain(self, chunk: str, send_kwargs: dict[str, Any]):
-        """MarkdownV2 first; on a parse/markdown rejection resend as stripped plain text."""
+        """MarkdownV2 first; on a Bot API entity-parse refusal resend as stripped plain text."""
+        def send(text: str, mode: Any):
+            return _await_with_thread_deadline(self._bot.send_message(text=text, parse_mode=mode, **send_kwargs),
+                                               timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
         try:
-            return await _await_with_thread_deadline(
-                self._bot.send_message(text=chunk, parse_mode=ParseMode.MARKDOWN_V2, **send_kwargs),
-                timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
+            return await send(chunk, ParseMode.MARKDOWN_V2)
         except Exception as md_error:
-            if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
-                logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
-                return await _await_with_thread_deadline(
-                    self._bot.send_message(text=_strip_mdv2(chunk), parse_mode=None, **send_kwargs),
-                    timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
-            raise
+            if not is_entity_parse_error(md_error):  # an HTML 5xx page is no refusal: it may be in the chat
+                raise
+            logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
+            return await send(_strip_mdv2(chunk), None)
 
     async def _send_chunk_with_retries(
         self, chat_id: str, chunk: str, index: int, reply_to: Optional[str], metadata: Optional[dict[str, Any]],
@@ -3653,8 +3594,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         # getattr() — tests build adapters via object.__new__() (no __init__).
         if getattr(self, "_send_path_degraded", False):
             return SendResult(success=False, error="send_path_degraded", retryable=True)
-        # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
-        if not content or not content.strip():
+        # Skip blank or invisible-only text (Telegram 400 empty-text, or a visually empty bubble).
+        if is_visually_empty(content):
             return SendResult(success=True, message_id=None)
         # One chat at a time (held only around the API calls, never across the reconnect wait above), so
         # two concurrent split replies to one chat cannot interleave their chunks (#114396).
@@ -5192,8 +5133,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                     self._bot.send_voice, chat_id, reply_to, metadata, "voice", reset_media=lambda: audio_file.seek(0),
                     voice=audio_file, caption=_cap_text, parse_mode=_cap_parse_mode, duration=duration_secs)
             except Exception as _cap_error:
-                err = str(_cap_error).lower()
-                if _cap_parse_mode is not None and ("parse" in err or "entit" in err):
+                if _cap_parse_mode is not None and is_entity_parse_error(_cap_error):
                     logger.warning(
                         "[%s] voice caption MarkdownV2 rejected, retrying plain: %s", self.name, _redact_telegram_error_text(_cap_error))
                     _last_parse_error = _cap_error
@@ -5249,8 +5189,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
 
     async def send_multiple_images(
         self, chat_id: str, images: list[tuple], metadata: Optional[dict[str, Any]] = None, human_delay: float = 0.0) -> SendResult:
-        """Send images as Telegram albums (``send_media_group``, 10 per chunk). Animated GIFs can't join a
-        media group (need ``send_animation``) so they go via the base per-image path, as does a failed chunk."""
+        """Send images as Telegram albums (``telegram_album.send_photo_album``). Animated GIFs can't join a
+        media group (need ``send_animation``) so they go via the base per-image path."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
         if not images:
@@ -5269,60 +5209,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             delivered = anim_result.success
         if not photos:
             return SendResult(success=delivered, error=None if delivered else "all images failed to send")
-        from urllib.parse import unquote as _unquote
-        CHUNK = 10  # Telegram's album limit
-        chunks = [photos[i:i + CHUNK] for i in range(0, len(photos), CHUNK)]
-        for chunk_idx, chunk in enumerate(chunks):
-            if human_delay > 0 and chunk_idx > 0:
-                await asyncio.sleep(human_delay)
-            media: list[Any] = []
-            opened_files: list[Any] = []
-            temp_paths: list[str] = []
-            try:
-                for image_url, alt_text in chunk:
-                    source: Any = image_url
-                    if image_url.startswith("file://"):
-                        local_path = _unquote(image_url[7:])
-                        if not os.path.exists(local_path):
-                            logger.warning("[%s] Skipping missing image in media group: %s", self.name, local_path)
-                            continue
-                        # Pre-compress large raster images so the media-group upload stays under
-                        # media_write_timeout; the temp JPEG is removed after the send.
-                        compressed = self._compress_image_to_jpeg(local_path)
-                        if compressed:
-                            temp_paths.append(compressed)
-                            local_path = compressed
-                        source = open(local_path, "rb")  # noqa: ASYNC230 -- file handle is streamed to the upload; a local open() is non-blocking in practice
-                        opened_files.append(source)
-                    media.append(InputMediaPhoto(media=source, caption=self._caption_1024(alt_text)))
-                if not media:
-                    continue
-                logger.info("[%s] Sending media group of %d photo(s) (chunk %d/%d)", self.name, len(media), chunk_idx + 1, len(chunks))
-                reply_to_id, send_kwargs = self._media_send_kwargs(chat_id, None, metadata)
-
-                def _reset_opened_files() -> None:
-                    for fh in opened_files:
-                        with contextlib.suppress(Exception):
-                            fh.seek(0)
-
-                await self._send_with_dm_topic_reply_anchor_retry(
-                    self._bot.send_media_group, {**send_kwargs, "media": media}, metadata, reply_to_id,
-                    "media group", reset_media=_reset_opened_files)
-                delivered = True
-            except Exception as e:
-                logger.warning(
-                    "[%s] send_media_group failed (chunk %d/%d), falling back to per-image: %s", self.name,
-                    chunk_idx + 1, len(chunks), _redact_telegram_error_text(e), exc_info=True)
-                fallback = await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
-                delivered = delivered or fallback.success
-            finally:
-                for fh in opened_files:
-                    with contextlib.suppress(Exception):
-                        fh.close()
-                for tmp in temp_paths:
-                    with contextlib.suppress(OSError):
-                        os.remove(tmp)
-        return SendResult(success=delivered, error=None if delivered else "all images failed to send")
+        from plugins.platforms.telegram.telegram_album import send_photo_album
+        return await send_photo_album(self, chat_id, photos, metadata, human_delay, delivered=delivered)
 
     async def send_image_file(
         self, chat_id: str, image_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None,
@@ -7226,33 +7114,14 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
 # into this bundled plugin. Mirrors the Discord (#24356) / Slack migrations: a register(ctx) entry point
 # plus hook implementations that replace the per-platform core touchpoints (the Platform.TELEGRAM branch in
 # gateway/run.py, the telegram_cfg YAML→env/extra block in gateway/config.py, the _setup_telegram wizard +
-# _PLATFORMS["telegram"] static dict in hermes_cli/{setup,gateway}.py, and the _send_telegram dispatch in
-# tools/send_message_tool.py). Telegram uses the generic token connected check, so no is_connected override
+# _PLATFORMS["telegram"] static dict in hermes_cli/{setup,gateway}.py; the out-of-process sender lives in
+# standalone.py as standalone_sender_fn). Telegram uses the generic token connected check, so no is_connected override
 # is needed. ──────────────────────────────────────────────────────────────────────────
-def _resolve_notifications_mode() -> str:
-    """Notification mode (all/important) from env, else config.yaml display.platforms.telegram.notifications."""
-    mode = os.getenv("HERMES_TELEGRAM_NOTIFICATIONS", "")
-    if not mode:
-        try:
-            from gateway.config import load_gateway_config
-            from gateway.run import cfg_get
-            _raw = cfg_get(load_gateway_config(), "display", "platforms", "telegram", "notifications")
-            if _raw not in {None, ""}:
-                mode = str(_raw).strip().lower()
-        except Exception:
-            pass
-    mode = mode or "important"
-    if mode not in {"all", "important"}:
-        logger.warning("Unknown telegram notifications mode '%s', defaulting to 'important' (valid: all, important)", mode)
-        mode = "important"
-    return mode
-
-
 def _build_adapter(config):
     """Construct TelegramAdapter and apply the notification mode."""
     adapter = TelegramAdapter(config)
     try:
-        adapter._notifications_mode = _resolve_notifications_mode()
+        adapter._notifications_mode = resolve_notifications_mode()
     except Exception:
         adapter._notifications_mode = "important"
     return adapter
@@ -7266,20 +7135,6 @@ def _is_connected(config) -> bool:
         import hermes_cli.gateway as gateway_mod
         token = gateway_mod.get_env_value("TELEGRAM_BOT_TOKEN") or ""
     return bool(str(token).strip())
-
-
-async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_files=None, force_document=False):
-    """Out-of-process delivery (standalone_sender_fn) so deliver=telegram cron jobs succeed without the
-    gateway; delegates to the REST ``_send_telegram`` sender."""
-    token = getattr(pconfig, "token", None)
-    if not token:
-        from agent.secret_scope import get_secret  # profile-scoped: never borrow another profile's token
-        token = get_secret("TELEGRAM_BOT_TOKEN", "") or ""
-    disable_link_previews = bool(getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews"))
-    from tools.send_message_tool import _send_telegram
-    return await _send_telegram(
-        token, chat_id, message, media_files=media_files, thread_id=thread_id,
-        disable_link_previews=disable_link_previews, force_document=force_document)
 
 
 def interactive_setup() -> None:
@@ -7368,13 +7223,14 @@ def register(ctx) -> None:
     """Plugin entry point — called by the Hermes plugin system."""
     from .adapter_hint import PLATFORM_HINT
     from .dashboard_card import DASHBOARD_CARD
+    from .standalone import standalone_send
     from . import gateway_env  # env -> GatewayConfig bridge (gateway.config_env)
     ctx.register_platform(
         name="telegram", label="Telegram", adapter_factory=_build_adapter, check_fn=telegram_deps_present,
         **DASHBOARD_CARD,
         ensure_deps_fn=check_telegram_requirements, is_connected=_is_connected, required_env=["TELEGRAM_BOT_TOKEN"],
         install_hint=t("platform.telegram.install_hint"), setup_fn=interactive_setup, apply_yaml_config_fn=_apply_yaml_config, cron_deliver_env_var="TELEGRAM_HOME_CHANNEL",
-        standalone_sender_fn=_standalone_send, max_message_length=4096, emoji="✈️", allow_update_command=True,
+        standalone_sender_fn=standalone_send, max_message_length=4096, emoji="✈️", allow_update_command=True,
         platform_hint=PLATFORM_HINT,
         display_tier="high",
         # Mobile inbox: quiet tool_progress / busy-ack, but keep interim commentary and heartbeats.

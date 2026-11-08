@@ -603,6 +603,7 @@ When `base_url` is set, Hermes:
 - Builds the python-telegram-bot client against the local server
 - Auto-lifts its internal document/audio size cap from 20 MB → 2 GB
 - Reports the active limit in the "too large" error message (`Maximum: 2048 MB.`) so it's obvious which mode you're in
+- Sends through the same server outside the gateway too: `hermes send`, the `send_message` tool and cron deliveries that fall back to the standalone sender
 
 Restart the gateway and look for a confirmation log line:
 
@@ -1155,6 +1156,8 @@ gateway:
 
 This setting is for client-rendering/copy compatibility; Hermes already falls back automatically when Telegram rejects the rich API call. `rich_drafts` controls whether the DM streaming preview *renders* rich (`sendRichMessageDraft`) and stays off by default because Telegram Desktop/macOS can visually overlay rich draft frames until the chat redraws; with it off, the preview streams plain and the final still arrives as a native Rich Message.
 
+The same setting applies to sends made outside the gateway process: `hermes send`, the `send_message` tool, and cron deliveries that fall back to the standalone sender take the rich path under the same rules. They also escape the `(1/2)` chunk marker on long messages, and treat only Telegram's own HTML tags (`<b>`, `<a>`, `<code>`, ...) as HTML. A `<details>` block or an angle-bracket placeholder therefore keeps its Markdown formatting. A message the Bot API still rejects as HTML is retried as MarkdownV2 before falling back to plain text. Two or more photos sent together arrive as a native album (`sendMediaGroup`, 10 per album).
+
 CJK text (Chinese, Japanese, Korean, and rare Han extensions) stays on the legacy MarkdownV2 path by default because affected Telegram Desktop/macOS clients have rendered Bot API rich messages with overlapping CJK glyph artifacts. If you use an unaffected client and prefer native rich tables/task lists/details/math for CJK payloads, set `allow_cjk_rich_messages: true` alongside `rich_messages: true` to opt in to that client-side risk.
 
 If you only want the legacy "always code-block" table behavior while keeping rich messages enabled, disable table normalization by setting `telegram.pretty_tables: false` in `config.yaml` (default: `true`).
@@ -1320,6 +1323,8 @@ In some restricted networks, `api.telegram.org` may resolve to an IP that is unr
 3. Known IPv4 Telegram API IPs are tried **before** the dual-stack `api.telegram.org` hostname. A blackholed IPv6 path can sit in `connect()` without erroring, which used to pin the event loop so the 30s init deadline never fired.
 4. If DoH is also blocked or times out, a hardcoded IPv4 seed list (`149.154.166.110`, `149.154.167.220`) is used as that IPv4-first list. The hostname remains last resort.
 5. Once a path succeeds, it becomes "sticky" — subsequent requests use it directly. The hostname is kept as a last resort for IPv6-only networks.
+
+Sends made outside the gateway process (`hermes send`, the `send_message` tool, standalone cron delivery) use the same transport with your configured IPs or the seed list. They skip DoH discovery so a one-shot send stays fast. They also use the gateway's `HERMES_TELEGRAM_HTTP_*` timeouts and its 60s media-upload write timeout. A connect or pool timeout is retried there, because the request never left. Any other timeout is not retried: Telegram may already have delivered the message.
 
 ### Configuration
 
@@ -1488,6 +1493,8 @@ HERMES_TELEGRAM_NOTIFICATIONS=all
 ```
 
 Unknown values log a warning and fall back to `important`.
+
+`hermes send`, the `send_message` tool and standalone cron delivery follow the same mode. Under `important` their messages arrive silently, except cron briefs, which ring by default (`cron.delivery.notify`, as in the gateway lane).
 
 ## Status messages edited in place
 
