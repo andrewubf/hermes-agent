@@ -28,8 +28,10 @@ from gateway.platforms._shared import (
 )
 
 
-def _redact_telegram_error_text(error: object) -> str:
-    """Redact secrets from Telegram transport errors before logging or returning them."""
+def _redact_telegram_error_text(error: object, proxy_url: str | None = None) -> str:
+    """Secret-redacted error text; only type + proxy host:port when the proxy URL holds a secret the text may echo."""
+    if proxy_url and isinstance(error, BaseException) and (shown := describe_proxy_error(error, proxy_url)):
+        return shown
     text = "" if error is None else str(error)
     if not text:
         # httpx timeout exceptions (ConnectTimeout, ReadTimeout, ...) stringify to "" — keep the
@@ -144,7 +146,7 @@ from agent.i18n import get_language, t
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter, ExecApprovalPrompt, SendResult, classify_send_error, unauthorized_action_notice,
-    cache_image_from_bytes_async, cache_audio_from_bytes_async, cache_video_from_bytes_async, resolve_proxy_url, SUPPORTED_VIDEO_TYPES,
+    cache_image_from_bytes_async, cache_audio_from_bytes_async, cache_video_from_bytes_async, resolve_proxy_url, safe_proxy_url_for_log, describe_proxy_error, SUPPORTED_VIDEO_TYPES,
     SUPPORTED_DOCUMENT_TYPES, SUPPORTED_IMAGE_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS, utf16_len,
 )
 
@@ -521,6 +523,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
 
     # Bound for the per-(chat_id, status_key) status-message cache; FIFO half-trim on overflow.
     _STATUS_MESSAGE_IDS_MAX = 2000
+    _ptb_proxy_url: str | None = None  # set by _build_ptb_requests; error text then shows no detail
 
     MAX_MESSAGE_LENGTH = 4096
     supports_code_blocks = True  # MarkdownV2 renders fenced code blocks
@@ -2059,12 +2062,12 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         if attempt > MAX_NETWORK_RETRIES:
             message = (
                 f'Telegram polling could not reconnect after {MAX_NETWORK_RETRIES:d} network error retries. Escalating to gateway recovery.')
-            await self._go_fatal_network(message, "[%s] %s Last error: %s", self.name, message, _redact_telegram_error_text(error))
+            await self._go_fatal_network(message, "[%s] %s Last error: %s", self.name, message, _redact_telegram_error_text(error, self._ptb_proxy_url))
             return
         delay = min(BASE_DELAY * (2 ** (attempt - 1)), MAX_DELAY)
         logger.warning(
             "[%s] Telegram network error (attempt %d/%d), reconnecting in %ds. Error: %s", self.name, attempt,
-            MAX_NETWORK_RETRIES, delay, _redact_telegram_error_text(error))
+            MAX_NETWORK_RETRIES, delay, _redact_telegram_error_text(error, self._ptb_proxy_url))
         await asyncio.sleep(delay)
         if self._teardown_started:
             return
@@ -2094,7 +2097,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         except Exception as retry_err:
             if self._teardown_started:
                 return
-            logger.warning("[%s] Telegram polling reconnect failed: %s", self.name, _redact_telegram_error_text(retry_err))
+            logger.warning("[%s] Telegram polling reconnect failed: %s", self.name, _redact_telegram_error_text(retry_err, self._ptb_proxy_url))
             # Polling is dead and no more error callbacks will fire — chain the retry ourselves.
             if not self.has_fatal_error and not self._teardown_started:
                 task = asyncio.ensure_future(self._handle_polling_network_error(retry_err))
@@ -2418,7 +2421,6 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             await self._drain_polling_connections()
             if self._teardown_started:
                 return
-            # Stable local ref: a concurrent disconnect() may null self._app across the awaits above.
             app = self._app
             # Capture a stable local reference: self._app can be reassigned to None by a concurrent
             # disconnect() while we're suspended across the awaits above (same race #55992 fixed on the
@@ -2428,9 +2430,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             expected_generation = self._polling_generation + 1
             if not app:
                 raise RuntimeError("Telegram application was torn down during conflict reconnect")
-            # drop_pending_updates=True makes Telegram terminate any other getUpdates session for this
-            # token (zombie or our own prior retry); without it each retry is immediately 409'd.
-            # The competing session is either a zombie from the previous gateway process (whose long-poll
+            # drop_pending_updates=True: the competing session is either a zombie from the previous gateway process (whose long-poll
             # hasn't expired server-side yet) or our own previous retry's still-expiring session. Without
             # this, each retry starts a new getUpdates session that immediately gets 409'd by the previous
             # one, creating the very conflict we are trying to recover from (#75017).
@@ -2448,7 +2448,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                     return
                 logger.warning(
                     "[%s] Telegram polling retry %d/%d failed: %s. Scheduling next attempt.", self.name,
-                    self._polling_conflict_count, MAX_CONFLICT_RETRIES, _redact_telegram_error_text(retry_err))
+                    self._polling_conflict_count, MAX_CONFLICT_RETRIES, _redact_telegram_error_text(retry_err, self._ptb_proxy_url))
                 # Never return silently: alive-and-"connected" with no polling is limbo.
                 if self._polling_conflict_count < MAX_CONFLICT_RETRIES and not self._teardown_started:
                     # get_running_loop(): get_event_loop() raises on 3.10+ from PTB's callback context.
@@ -2467,7 +2467,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             "The previous gateway session is still held open on Telegram's servers, "
             "or another process is using the same bot token. To recover: ensure no other Hermes or OpenClaw instance is running "
             "with this token, then restart the gateway with 'hermes gateway restart'.")
-        logger.error("[%s] %s Original error: %s", self.name, message, _redact_telegram_error_text(error))
+        logger.error("[%s] %s Original error: %s", self.name, message, _redact_telegram_error_text(error, self._ptb_proxy_url))
         # Snapshot whether WE transition to fatal: a concurrent retry task suspended past the entry
         # guard reaches this branch too. Only the first transition notifies.
         _already_fatal = self.has_fatal_error and self.fatal_error_code == "telegram_polling_conflict"
@@ -3001,7 +3001,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 fallback_ips = list(SEED_FALLBACK_IPS)
             else:
                 logger.info("[%s] Auto-discovered Telegram fallback IPs: %s", self.name, ", ".join(fallback_ips))
-        proxy_url = resolve_proxy_url(
+        proxy_url = self._ptb_proxy_url = resolve_proxy_url(
             "TELEGRAM_PROXY", target_hosts=["api.telegram.org", *fallback_ips],
             configured=self.config.extra.get("proxy_url"))
 
@@ -3027,7 +3027,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 {"transport": TelegramFallbackTransport(fallback_ips, **_transport_kwargs)},
                 {"transport": TelegramFallbackTransport(fallback_ips, **_updates_transport_kwargs)})
         elif proxy_url:
-            logger.info("[%s] Proxy detected; passing explicitly to HTTPXRequest: %s", self.name, proxy_url)
+            logger.info("[%s] Proxy detected; passing explicitly to HTTPXRequest: %s", self.name, safe_proxy_url_for_log(proxy_url))
             request, get_updates_request = _pair(_with_limits(), {"limits": _updates_limits}, proxy=proxy_url)
         else:
             if disable_fallback:
@@ -3158,10 +3158,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 self._spawn_polling_recovery(loop, self._handle_polling_conflict(error))
             elif self._looks_like_network_error(error):
                 logger.warning(
-                    "[%s] Telegram network error, scheduling reconnect: %s", self.name, _redact_telegram_error_text(error))
+                    "[%s] Telegram network error, scheduling reconnect: %s", self.name, _redact_telegram_error_text(error, self._ptb_proxy_url))
                 self._spawn_polling_recovery(loop, self._handle_polling_network_error(error))
             else:
-                logger.error("[%s] Telegram polling error: %s", self.name, _redact_telegram_error_text(error), exc_info=True)
+                logger.error("[%s] Telegram polling error: %s", self.name, _redact_telegram_error_text(error, self._ptb_proxy_url), exc_info=describe_proxy_error(error, self._ptb_proxy_url) is None)
 
         self._polling_error_callback_ref = _polling_error_callback  # reused by _handle_polling_conflict
         drop_pending = self._cold_boot_drop_pending(is_reconnect=is_reconnect)
@@ -3256,7 +3256,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             return True
         except Exception as e:
             self._release_platform_lock()
-            safe_error = _redact_telegram_error_text(e)
+            safe_error = _redact_telegram_error_text(e, self._ptb_proxy_url)
             # Classify by exception TYPE (never message text): auth failures can never self-heal, so
             # marking them retryable put agents into a silent eternal reconnect loop.
             if self._looks_like_auth_error(e):

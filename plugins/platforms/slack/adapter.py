@@ -51,7 +51,7 @@ from plugins.platforms.slack.adapter_config_readers import (
 from gateway.platforms.base import (
     gateway_trust_env, BasePlatformAdapter, ExecApprovalPrompt,
     SendResult, SUPPORTED_DOCUMENT_TYPES, SUPPORTED_VIDEO_TYPES, _TEXT_INJECT_EXTENSIONS,
-    is_host_excluded_by_no_proxy, resolve_proxy_url, ssrf_redirect_guard,
+    is_host_excluded_by_no_proxy, resolve_proxy_url, safe_proxy_url_for_log, ssrf_redirect_guard, describe_proxy_error,
     cache_document_from_bytes_async, cache_video_from_bytes_async,
 )
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
@@ -871,7 +871,7 @@ def _resolve_slack_proxy_url() -> Optional[str]:
     if not normalized.startswith(("http://", "https://")):
         logger.info(
             "[Slack] Ignoring unsupported proxy scheme for Slack transport: %s",
-            safe_url_for_log(proxy_url))
+            safe_proxy_url_for_log(proxy_url))
         return None
     if any(is_host_excluded_by_no_proxy(host) for host in _SLACK_PROXY_HOSTS):
         logger.info("[Slack] NO_PROXY bypasses Slack proxy configuration")
@@ -1778,7 +1778,7 @@ class SlackAdapter(BasePlatformAdapter):
                 return False
         proxy_url = _resolve_slack_proxy_url()
         if proxy_url:
-            logger.info("[Slack] Using proxy for Slack transport: %s", safe_url_for_log(proxy_url))
+            logger.info("[Slack] Using proxy for Slack transport: %s", safe_proxy_url_for_log(proxy_url))
         bot_tokens = _load_slack_bot_tokens(raw_token, quiet=False)
         lock_acquired = False
         try:
@@ -1792,11 +1792,9 @@ class SlackAdapter(BasePlatformAdapter):
             # A zombie Socket Mode handler would double-respond to every event.
             await self._stop_socket_mode_handler()
             await self._close_workspace_clients()
-            # Close any previous handler before creating a new one so that calling connect() a second time
-            # (e.g. during a gateway restart or in-process reconnect attempt) does not leave a zombie Socket
-            # Mode connection alive. Both the old and new connections would otherwise receive every Slack
-            # event and dispatch it twice, producing double responses — the same bug that affected
-            # DiscordAdapter (#18187).
+            # Close any previous handler before creating a new one so a second connect() (gateway restart,
+            # in-process reconnect) leaves no zombie Socket Mode connection receiving and dispatching every
+            # event twice — the same bug that affected DiscordAdapter (#18187).
             self._app = None
             self._app_token = app_token
             self._proxy_url = proxy_url
@@ -1827,7 +1825,8 @@ class SlackAdapter(BasePlatformAdapter):
             self._hint_allow_bots()
             return True
         except Exception as e:  # pragma: no cover - defensive logging
-            logger.error("[Slack] Connection failed: %s", e, exc_info=True)
+            proxy_error = describe_proxy_error(e, proxy_url)
+            logger.error("[Slack] Connection failed: %s", proxy_error or e, exc_info=not proxy_error)
             return False
         finally:
             if lock_acquired and not self._running:
@@ -6797,8 +6796,8 @@ async def _standalone_send(
                 if last_error not in _WRONG_WORKSPACE_TOKEN_ERRORS:
                     break
         return send_error(f"Slack API error: {last_error}")
-    except Exception as e:
-        return send_error(f"Slack send failed: {e}")
+    except Exception as e:  # the text may echo the proxy URL: it reaches the model
+        return send_error(f"Slack send failed: {describe_proxy_error(e, resolve_proxy_url()) or e}")
 
 
 _SETUP_STEPS = (
