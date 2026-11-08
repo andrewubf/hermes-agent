@@ -163,7 +163,7 @@ class HostedRoomRuntime:
         self._leases: dict[str, state.DriverLease] = {}
         self._recovered_leases: set[tuple[str, int]] = set()
         self._inspected_indeterminate_attempts: set[tuple[str, str, int]] = set()
-        self._ambiguous_rooms: dict[str, float] = {}
+        self._unwatched_attempts: dict[str, state.TaskAttempt] = {}
         self._unavailable_route_retries: dict[tuple[str, str], dict[str, float]] = {}
         self._blocked_rooms: set[str] = set()
         self._status_lock, self._current_tasks = threading.Lock(), {}
@@ -634,7 +634,7 @@ class HostedRoomRuntime:
                         self._record_error(f"worker maintenance failed: {exc}")
                 with self._status_lock:
                     self._cycles += 1
-                self._wake.wait(self.poll_interval_seconds)
+                self._wake.wait(min(self.poll_interval_seconds, self.lease_ttl_seconds / 3))
         finally:
             while True:
                 with self._status_lock:
@@ -654,6 +654,7 @@ class HostedRoomRuntime:
                     return
                 self._run_room_once(binding)
             return
+        self._renew_watched_leases()
         with self._status_lock:
             self._room_threads = {
                 room_id: t for room_id, t in self._room_threads.items() if t.is_alive()}
@@ -708,14 +709,10 @@ class HostedRoomRuntime:
                 self._set_blocked(binding.room_id, True)
                 return
             self._set_blocked(binding.room_id, False)
+        self._retire_unwatched_attempt(binding)
         if self.prepare_room is not None:
             self.prepare_room(binding)
         self._inspect_abandoned_attempts(binding)
-        deferred_until = self._ambiguous_rooms.get(binding.room_id)
-        if deferred_until is not None:
-            if self._tasks(binding, "running") and self.clock() < deferred_until:
-                return
-            self._ambiguous_rooms.pop(binding.room_id, None)
         lease = self._ensure_lease(binding)
         if (lease.room_id, lease.lease_generation) not in self._recovered_leases:
             state.recover_room(self.db_path, lease, clock=self.clock)
@@ -750,6 +747,18 @@ class HostedRoomRuntime:
         return delay
 
     # ------------------------------------------------------------------ leases
+    def _renew_watched_leases(self) -> None:
+        # Workers can spend the whole lease window inside a transport read. The supervisor
+        # renews only their existing proofs; a real takeover must still fence the worker.
+        with self._status_lock:
+            leases = [self._leases[room_id] for room_id in self._current_tasks
+                      if room_id in self._leases]
+        for lease in leases:
+            try:
+                self._renew_lease_if_needed(lease)
+            except Exception as exc:  # health: allow BLE001 -- one room's failure must not stop the others
+                self._record_error(f"room {lease.room_id} lease renewal failed: {exc}")
+
     def _ensure_lease(self, binding: HostedRoomBinding) -> state.DriverLease:
         with self._status_lock:
             current = self._leases.get(binding.room_id)
@@ -856,14 +865,36 @@ class HostedRoomRuntime:
         finally:
             with self._status_lock:
                 self._current_tasks.pop(binding.room_id, None)
+                if not self._stop.is_set():  # a stopping runtime leaves it to the next process's recovery
+                    self._unwatched_attempts[binding.room_id] = attempt
                 # The task may have published a reply or exposed the next turn while this
                 # thread held its slot: schedule exactly one follow-up after it leaves
                 # (idle room scans never set this marker).
                 self._rooms_needing_reschedule.add(binding.room_id)
 
     def _mark_ambiguous(self, binding: HostedRoomBinding, attempt: state.TaskAttempt) -> None:
-        self._drop_lease(binding.room_id)
-        self._ambiguous_rooms[binding.room_id] = attempt.lease.expires_at
+        # The supervisor may have renewed the lease during the submit, so its lapse cannot be
+        # what fences this attempt: retire it now, as lost observation does.
+        try:
+            state.mark_attempt_indeterminate(self.db_path, attempt, attempt.lease, clock=self.clock)
+        except (state.StaleLeaseError, state.RoomUnavailableError):
+            self._drop_lease(binding.room_id)  # the next pass retires it under a new lease
+
+    def _retire_unwatched_attempt(self, binding: HostedRoomBinding) -> None:
+        """Retire the attempt this room's last worker left ``running`` after an error, such as a
+        locked database. Nothing watches it any more and this process's live lease never fences it,
+        so it would hold the group chat for good. Only that worker names it, on its way out, so an
+        attempt being watched cannot be touched; a newer attempt has another generation."""
+        with self._status_lock:
+            attempt = self._unwatched_attempts.get(binding.room_id)
+        if attempt is None:
+            return
+        if any(task["identity"] == attempt.identity and task["execution_generation"] == attempt.execution_generation
+               for task in self._tasks(binding, "running")):
+            state.mark_attempt_indeterminate(
+                self.db_path, attempt, self._ensure_lease(binding), clock=self.clock)
+        with self._status_lock:
+            self._unwatched_attempts.pop(binding.room_id, None)
 
     def _on_terminal(
         self, binding: HostedRoomBinding, attempt: state.TaskAttempt, receipt: Mapping[str, Any]

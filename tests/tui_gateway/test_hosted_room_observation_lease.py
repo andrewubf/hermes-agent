@@ -232,7 +232,10 @@ def test_observation_retry_preserves_state_and_admission_errors(observed, monkey
     monkeypatch.setattr(o.rpc, 'history', observe)
     o.runtime._process_room(BINDING)
     assert reads[-1] == 133
-    expected = {'not_admitted': 'queued', 'refused_before_submit': 'failed'}.get(error, 'running')
+    # A worker that gives up on the attempt retires it: an uncertain turn, never a settled one.
+    expected = {'not_admitted': 'queued', 'refused_before_submit': 'failed',
+                state.InvalidTaskTransitionError: 'indeterminate',
+                state.RoomUnavailableError: 'indeterminate'}.get(error, 'running')
     assert state.get_task(o.db, o.identity)['status'] == expected
     if error in (state.StaleLeaseError, state.StaleTaskError):
         assert 'fenced: state fence' in o.runtime._last_error

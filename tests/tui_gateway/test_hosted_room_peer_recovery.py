@@ -320,7 +320,7 @@ def test_a_recovered_peer_turn_still_running_is_stopped_at_its_execution_deadlin
     assert "room-1" not in service.runtime.status()["blocked_rooms"]
 
 
-def test_contradictory_admission_flags_keep_the_same_attempt_at_lease_expiry(db):
+def test_contradictory_admission_flags_keep_the_same_attempt(db):
     now = [100.0]
     identity = _identity()
     _admit(db, identity)
@@ -334,7 +334,7 @@ def test_contradictory_admission_flags_keep_the_same_attempt_at_lease_expiry(db)
     runtime = _runtime(db, rpc, clock=lambda: now[0], lease_ttl_seconds=1)
     runtime._run_cycle()
     first = driver.get_task(db, identity)
-    assert first["status"] == "running" and first["execution_generation"] == 1
+    assert first["status"] == "indeterminate" and first["execution_generation"] == 1
     runtime._run_cycle()
     now[0] += 2
     runtime._run_cycle()
