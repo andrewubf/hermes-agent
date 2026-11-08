@@ -353,6 +353,7 @@ class _MatrixApprovalPrompt:
     requester_user_id: str | None = None
     expires_at: float | None = None
     request_id: str | None = None  # the tools.approval request this prompt answers
+    offered: tuple[str, ...] = ()  # choices the card seeded; a Deny-only card offers only "deny"
     bot_reaction_events: dict[str, str] = field(default_factory=dict, init=False)  # emoji -> event_id
 
 
@@ -1684,9 +1685,10 @@ class MatrixAdapter(BasePlatformAdapter):
         tier = "once"
         if not prompt.smart_denied:
             tier = "always" if "always" in choices else ("session" if "session" in choices else "once")
+        # A Deny-only card (command not shown in full) must not tell the user how to approve it.
+        hint = f"{t(self._EA_TYPED_HINT_KEYS[tier])}\n\n" if "once" in choices else ""
         text = (
-            f"{prompt.text}\n\n"
-            f"{t(self._EA_TYPED_HINT_KEYS[tier])}\n\n"
+            f"{prompt.text}\n\n{hint}"
             f"{t('platform.matrix.approval.legend_intro')}\n" + "\n".join(t(self._EA_LEGEND_KEYS[c]) for c in choices))
         reactions = tuple(self._EA_REACTIONS[c] for c in choices)
         session_key, chat_id = prompt.session_key, prompt.chat_id
@@ -1698,7 +1700,7 @@ class MatrixAdapter(BasePlatformAdapter):
             self._approval_prompt_by_session[session_key] = message_id
             return _MatrixApprovalPrompt(
                 session_key=session_key, chat_id=chat_id, message_id=message_id, requester_user_id=requester,
-                expires_at=expires_at, request_id=prompt.request_id)
+                expires_at=expires_at, request_id=prompt.request_id, offered=tuple(choices))
         return await self._send_reaction_prompt(
             chat_id, text, prompt.metadata, _make, self._approval_prompts_by_event, reactions, "approval")
 
@@ -2545,6 +2547,9 @@ class MatrixAdapter(BasePlatformAdapter):
             choices=self._approval_reaction_map)
         if choice is None:
             return handled
+        if prompt.offered and choice not in prompt.offered:  # a hand-added ✅ on a Deny-only card: keep it live
+            await self._send_invalid_reaction_feedback(room_id, reacts_to, t("platform.matrix.approval.invalid_reaction"))
+            return True
         try:
             from tools.approval import resolve_gateway_approval_card
             count = resolve_gateway_approval_card(prompt.session_key, choice, prompt.request_id)
