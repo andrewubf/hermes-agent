@@ -182,6 +182,7 @@ _MEDIA_KIND_KEYS = {
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from plugins.platforms.telegram.telegram_entities import expand_link_entities
 from plugins.platforms.telegram.telegram_held_inbound import TelegramHeldInboundMixin
+from plugins.platforms.telegram.telegram_media_group import flush_media_group_event, queue_media_group_event, tracking_album_items
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id, parse_send_target, parse_telegram_message_id
 from plugins.platforms.telegram.telegram_resolved_prompt import edit_keeping_prompt
 from plugins.platforms.telegram.telegram_topic_transfer import TopicTransferFn, apply_root_dm_topic_transfer
@@ -527,7 +528,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
     RICH_MESSAGE_MAX_CHARS = 32768  # Bot API 10.1 rich cap; above it use legacy chunking
     _SPLIT_THRESHOLD = 4000  # chunk near this length ⇒ a client-side split continuation is almost certain
-    MEDIA_GROUP_WAIT_SECONDS = 0.8
+    MEDIA_GROUP_WAIT_SECONDS = 1.5  # default album debounce; extra.media_group_wait_seconds overrides
     HELD_INBOUND_MAX = 64  # inbound events held across a disconnect window; oldest dropped first
     _GENERAL_TOPIC_THREAD_ID = "1"
     # send() can race a disconnect blip; failing "Not connected" (retryable=False) parks the answer in the
@@ -6289,10 +6290,13 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         if status == "ok":
             event.media_urls = []
             event.media_types = []
+            event.media_text_inlined = []
             self._attach_cached(event, cached, cached.context_note(), "[Telegram] Cached observed group %s at %s")
 
     def _attach_cached(self, event: MessageEvent, cached, note: str, log_fmt: str) -> None:
         """Append a cached attachment to the event (message type follows the kind only for the first one)."""
+        from plugins.platforms.telegram.telegram_batching import pad_inline_flags
+        event.media_text_inlined = pad_inline_flags(event) + [False]
         event.media_urls.append(cached.path)
         event.media_types.append(cached.media_type)
         if len(event.media_urls) == 1 and cached.kind in self._CACHED_KIND_TO_MESSAGE_TYPE:
@@ -6655,14 +6659,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
 
     def _merge_into_pending(self, pending: dict, key: str, event: MessageEvent) -> None:
         """Merge ``event`` into ``pending[key]`` (media, caption, reply expectation) or seed it."""
-        if (existing := pending.get(key)) is None:
-            pending[key] = event
-            return
-        existing.absorb_reply_expected(event)
-        existing.media_urls.extend(event.media_urls)
-        existing.media_types.extend(event.media_types)
-        if event.text:
-            existing.text = self._merge_caption(existing.text, event.text)
+        from plugins.platforms.telegram.telegram_batching import merge_batched_event
+        merge_batched_event(pending, key, event, merge_caption=self._merge_caption)
 
     def _enqueue_photo_event(self, batch_key: str, event: MessageEvent) -> None:
         """Merge photo events into a pending batch and schedule flush."""
@@ -6696,16 +6694,15 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                     return candidate
         return default
 
-    async def _cache_inbound_av(self, msg, event: MessageEvent, source: Any, label: str, kind: str, ext: str, mime: str) -> bool:
-        """Download a voice/audio/video attachment into the local cache. Returns True when the event was
-        already dispatched (oversized attachment), so the caller must return."""
+    async def _cache_inbound_av(self, msg, event: MessageEvent, source: Any, label: str, kind: str, ext: str, mime: str) -> None:
+        """Download a voice/audio/video attachment into the local cache. An oversized one only gets a note:
+        the caller's tail dispatches the event, so an album item still joins its album's turn."""
         try:
             allowed, note = self._telegram_media_size_allowed(source, label)
             if not allowed:
                 event.text = self._append_observed_note(event.text, note or "")
                 logger.info("[Telegram] Skipped oversized user %s (size=%s)", kind, getattr(source, "file_size", None))
-                await self.handle_message(event)
-                return True
+                return
             file_obj = await source.get_file()
             data = await file_obj.download_as_bytearray()
             if kind == "video":
@@ -6720,13 +6717,13 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         except Exception as e:
             logger.warning("[Telegram] Failed to cache %s: %s", kind, _redact_telegram_error_text(e), exc_info=True)
             await self._surface_media_cache_failure(msg, event, label, e)
-        return False
 
-    async def _dispatch_with_text(self, event: MessageEvent, text: str) -> bool:
-        """Replace the event text with a user-facing note and dispatch it; returns True (handled)."""
+    @staticmethod
+    def _note_instead_of_media(event: MessageEvent, text: str) -> bool:
+        """Replace the event text with a user-facing note; False lets the caller's tail dispatch it
+        (through the album queue for an album item, so the album stays one turn)."""
         event.text = text
-        await self.handle_message(event)
-        return True
+        return False
 
     @staticmethod
     def _set_cached_media(event: MessageEvent, path: str, mime: str, mtype: MessageType, log_fmt: str) -> None:
@@ -6737,7 +6734,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
 
     async def _cache_inbound_document(self, msg, event: MessageEvent) -> bool:
         """Cache a document attachment (image → photo path, video, else generic media + text injection).
-        Returns True when the event was already dispatched/routed so the caller must return."""
+        Returns True when the event was already routed (image documents), so the caller must return."""
         doc = msg.document
         try:
             original_filename = doc.file_name or ""
@@ -6751,7 +6748,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             # Size check before the image branch so image documents can't bypass the limit.
             if not doc.file_size or doc.file_size > self._max_doc_bytes:
                 logger.info("[Telegram] Document too large: %s bytes", doc.file_size)
-                return await self._dispatch_with_text(
+                return self._note_instead_of_media(
                     event, f"The document is too large or its size could not be verified. Maximum: {self._max_doc_bytes // (1024 * 1024)} MB.")
             # Screenshots/photos sent as documents take the image cache + batching path.
             if ext in _TELEGRAM_IMAGE_EXTENSIONS or doc_mime.startswith("image/"):
@@ -6762,7 +6759,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                     cached_path = await cache_image_from_bytes_async(bytes(image_bytes), ext=image_ext)
                 except ValueError as e:
                     logger.warning("[Telegram] Failed to cache image document: %s", _redact_telegram_error_text(e), exc_info=True)
-                    return await self._dispatch_with_text(event, f"Image document '{display}' could not be read as an image.")
+                    return self._note_instead_of_media(event, f"Image document '{display}' could not be read as an image.")
                 self._set_cached_media(
                     event, cached_path, doc_mime if doc_mime.startswith(
                         "image/"
@@ -6784,8 +6781,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 self._set_cached_media(
                     event, await cache_video_from_bytes_async(bytes(video_bytes), ext=ext), SUPPORTED_VIDEO_TYPES[ext], MessageType.VIDEO,
                     "[Telegram] Cached user video document at %s")
-                await self.handle_message(event)
-                return True
+                return False  # the caller's tail dispatches (album queue for an album item)
             # Any file type is accepted (authorization is the gate, not the extension); unknown types get
             # application/octet-stream. Image documents already returned above.
             file_obj = await doc.get_file()
@@ -6793,7 +6789,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             from gateway.platforms.base import cache_media_bytes_async
             cached = await cache_media_bytes_async(raw_bytes, filename=original_filename or f"document{ext or '.bin'}", mime_type=doc_mime)
             if cached is None:
-                return await self._dispatch_with_text(event, f"Document '{display}' could not be cached.")
+                return self._note_instead_of_media(event, f"Document '{display}' could not be cached.")
             event.media_urls = [cached.path]
             event.media_types = [cached.media_type]
             event.media_text_inlined = [False]  # flipped below once the text is actually injected
@@ -6818,6 +6814,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             await self._surface_media_cache_failure(msg, event, "attachment", e, display_name=getattr(doc, "file_name", None) or None)
         return False
 
+    @tracking_album_items
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming media messages, downloading images to local cache."""
         msg = update.message
@@ -6860,14 +6857,11 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 await self._surface_media_cache_failure(msg, event, "photo", e)
         # Voice/audio cached for STT transcription; video for vision.
         if msg.voice:
-            if await self._cache_inbound_av(msg, event, msg.voice, "voice message", "voice", ".ogg", "audio/ogg"):
-                return
+            await self._cache_inbound_av(msg, event, msg.voice, "voice message", "voice", ".ogg", "audio/ogg")
         elif msg.audio:
-            if await self._cache_inbound_av(msg, event, msg.audio, "audio file", "audio", ".mp3", "audio/mp3"):
-                return
+            await self._cache_inbound_av(msg, event, msg.audio, "audio file", "audio", ".mp3", "audio/mp3")
         elif video := msg.video or getattr(msg, "video_note", None):
-            if await self._cache_inbound_av(msg, event, video, "video file" if msg.video else "video note", "video", ".mp4", "video/mp4"):
-                return
+            await self._cache_inbound_av(msg, event, video, "video file" if msg.video else "video note", "video", ".mp4", "video/mp4")
         elif msg.document and await self._cache_inbound_document(msg, event):
             return
         media_group_id = getattr(msg, "media_group_id", None)
@@ -6877,21 +6871,11 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         await self.handle_message(event)
 
     async def _queue_media_group_event(self, media_group_id: str, event: MessageEvent) -> None:
-        """Debounce album items (shared media_group_id) into one MessageEvent so the second image isn't
-        treated as a new message interrupting the first."""
-        if self._should_drop_delayed_delivery():
-            self._hold_inbound_event(event, where="media-group-enqueue")
-            return
-        self._merge_into_pending(self._media_group_events, media_group_id, event)
-        self._accept_update()
-        prior_task = self._media_group_tasks.get(media_group_id)
-        if prior_task:
-            prior_task.cancel()
-        self._media_group_tasks[media_group_id] = asyncio.create_task(self._flush_media_group_event(media_group_id))
+        """Debounce album items (shared media_group_id) into one MessageEvent (see telegram_media_group)."""
+        await queue_media_group_event(self, media_group_id, event)
 
     async def _flush_media_group_event(self, media_group_id: str) -> None:
-        await self._flush_buffered(
-            self._media_group_events, self._media_group_tasks, media_group_id, self.MEDIA_GROUP_WAIT_SECONDS, "media-group")
+        await flush_media_group_event(self, media_group_id)
 
     async def _handle_sticker(self, msg: Message, event: MessageEvent) -> None:
         """Describe a sticker via vision, cached by file_unique_id; animated/video stickers get an emoji placeholder."""
