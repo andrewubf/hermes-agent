@@ -1130,6 +1130,7 @@ class _TargetDelivery:
     opened_thread_id: Optional[str]
     live_adapter_ready: bool = False
     live_error: Optional[str] = None  # the live lane's own rejection string, e.g. "send_path_degraded"
+    resolved_thread_id: Optional[str] = None  # numeric id of a named Telegram DM topic (media + mirror)
 
     @property
     def is_relay(self) -> bool:
@@ -1242,6 +1243,9 @@ def _live_route_metadata(t: _TargetDelivery) -> tuple[Optional[str], dict, dict]
         and looks_like_telegram_private_chat_id(str(t.chat_id))
         and _looks_like_int(str(thread_id))
     )
+    if (t.platform == Platform.TELEGRAM and thread_id is not None and not _looks_like_int(str(thread_id))
+            and looks_like_telegram_private_chat_id(str(t.chat_id))):
+        return _named_dm_topic_route(t)
     if is_ambiguous_telegram_topic and _is_channel_dm_topic(
         t.runtime_adapter, t.chat_id, t.loop, job["id"]):
         # Channel DM topic: direct_messages_topic_id, no bare thread_id; media mirrors text.
@@ -1270,6 +1274,32 @@ def _live_route_metadata(t: _TargetDelivery) -> tuple[Optional[str], dict, dict]
     # after a restart. See cron/scheduler_delivery_origin.py.
     _origin.stamp_origin_discriminators(t, route_metadata, media_metadata)
     return route_thread_id, route_metadata, media_metadata
+
+
+def _named_dm_topic_route(t: _TargetDelivery) -> tuple[Optional[str], dict, dict]:
+    """``telegram:<private_chat>:<topic name>`` (#80483): text goes to the router with the name as the
+    target thread (it creates/refreshes the topic by name, retrying once on thread-not-found); media
+    and the mirror use the numeric id from ``_resolve_named_dm_topic``. Raises when the name cannot
+    be resolved, so the target fails instead of landing in the chat root."""
+    route_metadata = {"job_id": t.job["id"], "notify": t.notify_delivery}
+    media_metadata = {"notify": t.notify_delivery, "thread_id": _resolve_named_dm_topic(t),
+                      "telegram_dm_topic_created_for_send": True}
+    _origin.stamp_origin_discriminators(t, route_metadata, media_metadata)
+    return str(t.thread_id), route_metadata, media_metadata
+
+
+def _resolve_named_dm_topic(t: _TargetDelivery) -> str:
+    """Resolve a named DM topic to its id via the adapter's ``ensure_dm_topic`` (a cache hit after the
+    first call) and record it on ``t``. Re-run after the text send: the router's thread-not-found
+    refresh recreates the topic and updates that cache, so media must not keep the pre-send id."""
+    from agent.async_utils import safe_schedule_threadsafe
+    from gateway.delivery import _ensure_named_dm_topic
+    future = safe_schedule_threadsafe(
+        _ensure_named_dm_topic(t.runtime_adapter, str(t.chat_id), str(t.thread_id), refresh=False), t.loop)
+    if future is None:
+        raise RuntimeError(f"cannot resolve named Telegram topic for {t.where}: gateway loop unavailable")
+    t.resolved_thread_id = future.result(timeout=30)
+    return t.resolved_thread_id
 
 
 _LIVE_SEND_CONFIRM_TIMEOUT_SECS = 60
@@ -1444,8 +1474,8 @@ def _seed_live_delivery_sessions(t: _TargetDelivery, delivered_message_id) -> No
             "skipped; the plain mirror below may still apply",
             job["id"], t.platform_name, t.chat_id,
             origin.get("platform"), origin.get("chat_id"), origin.get("thread_id"))
-    _maybe_mirror_cron_delivery(
-        job, t.platform_name, t.chat_id, t.mirror_text, thread_id=t.thread_id,
+    _maybe_mirror_cron_delivery(  # a named topic's sessions key on its numeric id, not its name
+        job, t.platform_name, t.chat_id, t.mirror_text, thread_id=t.resolved_thread_id or t.thread_id,
         user_id=t.origin_user_id,
         enabled=t.mirror_this_target and not thread_seeded and not inchannel_seeded)
 
@@ -1458,9 +1488,9 @@ def _deliver_via_live_adapter(
     this lane's soft failures (surfaced only if standalone also fails); ``delivery_errors`` =
     partial failures (media, thread fallback) that surface even on success."""
     job = t.job
-    route_thread_id, route_metadata, media_metadata = _live_route_metadata(t)
     delivered = False
     try:
+        route_thread_id, route_metadata, media_metadata = _live_route_metadata(t)
         # Send cleaned text (MEDIA tags stripped) through the gateway's DeliveryRouter so it gets
         # the same platform routing as live messages (Telegram's three-mode topic routing).
         text_to_send = cleaned_text.strip()
@@ -1486,6 +1516,15 @@ def _deliver_via_live_adapter(
         # gateway loop is contended, so each media send would also block its 30s budget, and the text
         # payload is already assumed delivered (#38922). Record the skipped attachments so the drop is
         # visible rather than silently lost.
+        if (adapter_ok and not timed_out and text_to_send and t.resolved_thread_id
+                and (media_files or t.mirror_this_target)):
+            # Named topic: media and the mirror follow a thread-not-found refresh made by the text
+            # send. The text is confirmed, so a failed lookup keeps the pre-send id, never a failure.
+            try:
+                media_metadata["thread_id"] = _resolve_named_dm_topic(t)
+            except Exception as e:
+                logger.warning("Job '%s': named topic re-lookup for %s failed (%s); keeping id %s",
+                               job["id"], t.where, e, t.resolved_thread_id, exc_info=True)
         if adapter_ok and not timed_out and media_files:
             _live_send_media(t, media_metadata, media_files, delivery_errors, unverified_targets)
         elif timed_out and media_files:
@@ -1642,8 +1681,8 @@ def _deliver_standalone(
         delivery_errors.append(msg)
     logger.info("Job '%s': delivered to %s:%s", job["id"], t.platform_name, t.chat_id)
     # Thread seeding only happens on the live lane, so no thread_seeded gate applies here.
-    _maybe_mirror_cron_delivery(
-        job, t.platform_name, t.chat_id, t.mirror_text, thread_id=t.thread_id,
+    _maybe_mirror_cron_delivery(  # a named topic's sessions key on its numeric id, not its name
+        job, t.platform_name, t.chat_id, t.mirror_text, thread_id=t.resolved_thread_id or t.thread_id,
         user_id=t.origin_user_id,
         enabled=t.mirror_this_target)
 
