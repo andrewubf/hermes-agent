@@ -182,6 +182,7 @@ _MEDIA_KIND_KEYS = {
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from plugins.platforms.telegram.telegram_entities import expand_link_entities
 from plugins.platforms.telegram.telegram_held_inbound import TelegramHeldInboundMixin
+from plugins.platforms.telegram.telegram_polling_probe import TelegramPendingProbeMixin
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id, parse_send_target, parse_telegram_message_id
 from plugins.platforms.telegram.telegram_resolved_prompt import edit_keeping_prompt
 from plugins.platforms.telegram.telegram_topic_transfer import TopicTransferFn, apply_root_dm_topic_transfer
@@ -476,6 +477,9 @@ _POLLING_PROGRESS_TIMEOUT = 60.0  # generation unhealthy until getUpdates return
 # #92991) and no other probe can see it. ~3x the worst-case poll window leaves ample margin against false
 # positives while still recovering within a few heartbeat intervals.
 _POLLING_STALL_TIMEOUT = 150.0
+# Sustained getUpdates progress this long, counted from the first progress after the last 409's restart, ends a
+# conflict episode; it exceeds the gap between two conflicts of one storm (the next poll), so the ladder can climb.
+_POLLING_CONFLICT_QUIET_PERIOD = 120.0
 # Ingress dispatch stall (#102260, #130407): the transport probes prove getUpdates round-trips complete, not
 # that PTB's dispatcher ever handed the fetched updates to a handler. A backlog with no dispatch progress for
 # four heartbeats (360s) hands the adapter to the supervisor for a rebuild (an in-place restart keeps the
@@ -516,7 +520,7 @@ class _PollingStallError(RuntimeError):
     """
 
 
-class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BasePlatformAdapter):
+class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, TelegramPendingProbeMixin, BasePlatformAdapter):
     """Telegram bot adapter: users/groups, MarkdownV2 replies, forum topics, media."""
 
     # Bound for the per-(chat_id, status_key) status-message cache; FIFO half-trim on overflow.
@@ -651,7 +655,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         self._bot_identity_refresh_task: Optional[asyncio.Task] = None
         self._post_connect_task: Optional[asyncio.Task] = None  # command menu + DM topics, off the connect path
         self._polling_conflict_count = self._polling_network_error_count = self._polling_generation = 0
-        self._polling_conflict_recovery_generation: Optional[int] = None
+        self._polling_conflict_quiet_since: Optional[float] = None
         self._polling_progress_event = asyncio.Event()
         self._polling_progress_accepting = self._polling_teardown_started = False
         self._polling_error_callback_ref = None
@@ -1711,10 +1715,16 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         self._polling_progress_event.set()
         self._polling_last_progress_monotonic = time.monotonic()
         self._polling_network_error_count = 0
-        if generation == self._polling_conflict_recovery_generation:
-            self._polling_conflict_recovery_generation = None
-        else:
-            self._polling_conflict_count = 0
+        # A conflict episode ends only after a quiet period: getUpdates also succeeds between the 409s of a
+        # live storm, so resetting on any progress pinned the ladder at (1/5) forever (#82303). The window opens
+        # at the first progress after the restart, so recovery downtime (stop, backoff, drain) never counts.
+        if self._polling_conflict_count:
+            quiet_since = self._polling_conflict_quiet_since
+            if quiet_since is None:
+                self._polling_conflict_quiet_since = self._polling_last_progress_monotonic
+            elif self._polling_last_progress_monotonic - quiet_since >= _POLLING_CONFLICT_QUIET_PERIOD:
+                self._polling_conflict_count = 0
+                self._polling_conflict_quiet_since = None
         # First proof getUpdates is flowing for this generation: flip a
         # published "retrying" (degraded connect, reconnect stamp, or the
         # mid-session recovery below) back to "connected" (#101391).
@@ -2008,13 +2018,22 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         self._set_fatal_error("telegram_network_error", message, retryable=True)
         await self._handoff_polling_fatal_error()
 
-    async def _stop_updater_or_go_fatal(self, app, what: str) -> bool:
+    async def _stop_updater_or_go_fatal(self, app, what: str, *, skip_read_receipt_cleanup: bool = False) -> bool:
         """Bounded ``updater.stop()`` before a recovery restart; False = went fatal, caller returns.
 
         Wall-clock deadline, not asyncio.wait_for: a CLOSE-WAIT socket wedges stop() on epoll and PTB/AnyIO shielded cleanup
         hangs wait_for. On timeout the Updater's lifecycle lock may still be held, so rebuild the adapter instead."""
         try:
             if app and app.updater and app.updater.running:
+                if skip_read_receipt_cleanup:
+                    # PTB's stop() finishes with a read-receipt getUpdates(timeout=0) that re-uses the very
+                    # pool the network error just broke; its getUpdates read timeout outlives the stop
+                    # deadline, so every transient error wedges stop() for the whole budget and escalates
+                    # to a full adapter rebuild (#131783). A same-Updater restart resumes from
+                    # _last_update_id, and admission receipts (#120257) dedupe the at-most-one unconfirmed
+                    # batch, so dropping this receipt costs no redelivery.
+                    if getattr(app.updater, "_Updater__polling_cleanup_cb", None) is not None:
+                        app.updater._Updater__polling_cleanup_cb = None
                 try:
                     await _await_with_thread_deadline(app.updater.stop(), timeout=_UPDATER_STOP_TIMEOUT)
                 except TimeoutError:
@@ -2072,7 +2091,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         app = self._app
         # Unguarded stop() on a CLOSE-WAIT socket would leave _polling_error_task perpetually
         # "in-flight" so every probe skips reconnect for hours.
-        if not await self._stop_updater_or_go_fatal(app, "network-recovery") or self._teardown_started:
+        if not await self._stop_updater_or_go_fatal(app, "network-recovery", skip_read_receipt_cleanup=True) or self._teardown_started:
             return
         # start_polling() bootstraps through the *general* pool before getUpdates; a confirmed pool timeout means the request
         # was never sent, so rebuilding that pool is safe. Generic network errors stay polling-only (sends untouched).
@@ -2111,6 +2130,14 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         connect-level failures feed ``_handle_polling_network_error``. Runs for the connection's lifetime, catching
         steady-state wedges the one-shot verifier can't."""
         HEARTBEAT_INTERVAL = 90   # seconds between probes
+        # Re-probe delay after a first stuck-pending observation: the second confirming observation must
+        # not wait a full HEARTBEAT_INTERVAL. Power-napping hosts (macOS Sleep↔DarkWake cycling, ~45s
+        # awake per ~16min) only run the loop inside short awake windows, so two probes spaced a whole
+        # heartbeat apart never land in the same window and the escalation can never complete — observed
+        # as seven first-stuck probes, zero confirmations, over 39 days (#139281). 30s still dwarfs the
+        # healthy transient (an update queued between arrival and the next getUpdates return, sub-second)
+        # while fitting probe + re-probe inside one awake window.
+        STUCK_CONFIRM_INTERVAL = 30
         PROBE_TIMEOUT = 15        # seconds before declaring the path dead
         # Wedged-recovery watchdog: note when a recovery task is first seen in-flight and force-escalate
         # if the *same* task object still runs past the stuck timeout.
@@ -2121,9 +2148,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         # long-lived task is unambiguously wedged. See #66377.
         stuck_task_ref: Optional[asyncio.Task] = None
         stuck_task_since = 0.0
+        next_interval = HEARTBEAT_INTERVAL
         while True:
             try:
-                await asyncio.sleep(HEARTBEAT_INTERVAL)
+                await asyncio.sleep(next_interval)
                 if self._teardown_started or self.has_fatal_error:
                     return
                 # A recovery task hung on an unbounded await gates every other recovery path forever
@@ -2168,97 +2196,31 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 # getUpdates consumer is alive: PTB can report updater.running=True while the long-poll task
                 # is wedged, so DMs queue in the Bot API and never reach handlers (#42909). get_me() is
                 # blind to this; get_webhook_info() exposes it via pending_update_count. Escalate only after
-                # two consecutive probes see a non-zero queue while we believe we're polling, so a single
-                # in-flight update (consumed before the next probe) never trips recovery.
-                await self._probe_pending_updates(bot, PROBE_TIMEOUT)
+                # two probes see a non-zero queue while we believe we're polling, so a single in-flight
+                # update (consumed before the next probe) never trips recovery — but the confirming probe
+                # runs after STUCK_CONFIRM_INTERVAL, not a full heartbeat, so the pair can complete inside
+                # one awake window on power-napping hosts (#139281).
+                queue_suspect = await self._probe_pending_updates(bot, PROBE_TIMEOUT)
                 # An empty queue can't hide a wedge forever: no round-trip past the stall threshold ⇒ dead.
                 # Even an empty queue cannot hide a wedged long-poll forever: Telegram answers within ~50s,
                 # so a consumer with no successful round-trip past the stall threshold is dead (#92991).
                 # Pure local-state check — no Bot API call needed.
                 await self._check_polling_stall()
-                # Transport health is not dispatch health (#102260). Pure local-state check.
-                self._check_ingress_dispatch_stall()
+                # Transport health is not dispatch health (#102260). Pure local-state check. It counts passes as
+                # full heartbeats, so a short confirm pass must not count or a slow handler trips it early.
+                if next_interval == HEARTBEAT_INTERVAL:
+                    self._check_ingress_dispatch_stall()
+                next_interval = STUCK_CONFIRM_INTERVAL if queue_suspect else HEARTBEAT_INTERVAL
             except asyncio.CancelledError:
                 return
             except (TimeoutError, OSError) as probe_err:
                 self._schedule_polling_recovery(probe_err, reason="heartbeat probe")
+                next_interval = HEARTBEAT_INTERVAL
             except Exception as probe_err:
                 # Non-connectivity errors (e.g. TelegramError 401) aren't CLOSE-WAIT symptoms.
                 if self._looks_like_network_error(probe_err):
                     self._schedule_polling_recovery(probe_err, reason="heartbeat probe")
-
-    async def _probe_pending_updates(self, bot, probe_timeout: float) -> None:
-        """Detect a wedged or stopped getUpdates consumer via pending_update_count.
-
-        PTB can report ``updater.running`` while the long-poll is stuck; get_me() stays healthy yet DMs queue in the
-        Bot API. A stuck queue over two consecutive probes ⇒ dead consumer. Also covers the updater having stopped
-        entirely (``running=False``, no reconnect in flight).
-
-        PTB can report ``updater.running == True`` while its long-poll task is silently stuck (e.g. a socket
-        that epoll keeps reporting readable on WSL2). ``get_me()`` stays healthy because it uses the general
-        request path, so the CLOSE-WAIT heartbeat never fires — yet DMs queue in the Bot API and never reach
-        handlers (#42909).
-        We detect the stopped updater directly and feed the same ladder (#55769).
-        """
-        # Polling mode only: in webhook mode Telegram pushes and holds no server-side queue.
-        if self._teardown_started or self._webhook_mode:
-            return
-        # An in-flight reconnect owns recovery — don't double-trigger, and don't misread its brief
-        # stop()->start_polling() window (updater.running transiently False) as dead.
-        if self._recovery_in_flight():
-            self._polling_not_running_count = 0
-            return
-        updater = getattr(self._app, "updater", None) if self._app else None
-        if updater is None:
-            self._polling_pending_stuck_count = 0
-            return
-        if not getattr(updater, "running", False):
-            # Long-poll task gone, general-path calls still succeed, so no error_callback/probe ever
-            # fires. Debounced over two probes so a just-starting updater never trips it.
-            self._polling_pending_stuck_count = 0
-            # We are in polling mode with no reconnect in flight, yet PTB's updater has stopped entirely.
-            # This is distinct from the wedged-but-running consumer handled below: the long-poll task is
-            # gone, get_me()/get_webhook_info() on the general request path still succeed, so no
-            # error_callback or connectivity probe ever fires and the gateway silently stops receiving
-            # messages while the process stays alive (#55769).
-            self._polling_not_running_count += 1
-            logger.warning(
-                "[%s] Telegram polling heartbeat: updater stopped while in polling mode (stuck probe %d/2)", self.name,
-                self._polling_not_running_count)
-            if self._polling_not_running_count >= 2:
-                self._polling_not_running_count = 0
-                self._escalate_stuck_consumer(
-                    "[%s] Telegram updater is not running (long-poll task gone); triggering polling restart",
-                    "Telegram updater stopped while in polling mode")
-            return
-        self._polling_not_running_count = 0
-        get_webhook_info = getattr(bot, "get_webhook_info", None)
-        if not callable(get_webhook_info):
-            return
-        try:
-            info = await asyncio.wait_for(get_webhook_info(), probe_timeout)  # type: ignore[arg-type]
-        except (TimeoutError, OSError):
-            return  # connectivity symptom for the get_me() path, not a stuck-queue signal
-        pending = int(getattr(info, "pending_update_count", 0) or 0)
-        if pending <= 0:
-            self._polling_pending_stuck_count = 0
-            return
-        self._polling_pending_stuck_count += 1
-        logger.warning(
-            "[%s] Telegram polling heartbeat: %d update(s) queued but not consumed (stuck probe %d/2)", self.name,
-            pending, self._polling_pending_stuck_count)
-        if self._polling_pending_stuck_count >= 2:
-            self._polling_pending_stuck_count = 0
-            self._escalate_stuck_consumer(
-                "[%s] getUpdates consumer appears wedged (queue not draining); triggering polling restart",
-                "getUpdates consumer wedged: pending updates not draining")
-
-    def _escalate_stuck_consumer(self, log_message: str, reason: str) -> None:
-        """Second consecutive stuck probe: restart polling via the network-error ladder (unless tearing down)."""
-        if self._teardown_started:
-            return
-        logger.warning(log_message, self.name)
-        self._polling_error_task = asyncio.get_running_loop().create_task(self._handle_polling_network_error(RuntimeError(reason)))
+                next_interval = HEARTBEAT_INTERVAL
 
     def _check_ingress_dispatch_stall(self) -> None:
         """Escalate fetched updates PTB's dispatcher is not handing to handlers (#102260, #130407).
@@ -2400,6 +2362,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         if self.has_fatal_error and self.fatal_error_code == "telegram_polling_conflict":
             return
         self._polling_conflict_count += 1
+        self._polling_conflict_quiet_since = None
         MAX_CONFLICT_RETRIES = 5
         # 15s, 25s, 35s, 45s, 55s — clears Telegram's ~30s session window without hammering the API.
         RETRY_DELAY = 10 + (self._polling_conflict_count * 10)  # seconds
@@ -2425,18 +2388,13 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             # network path). Re-reading self._app after that point would raise AttributeError deep inside
             # start_polling instead of failing fast here, where the except below reschedules or escalates to
             # fatal.
-            expected_generation = self._polling_generation + 1
             if not app:
                 raise RuntimeError("Telegram application was torn down during conflict reconnect")
-            # drop_pending_updates=True makes Telegram terminate any other getUpdates session for this
-            # token (zombie or our own prior retry); without it each retry is immediately 409'd.
-            # The competing session is either a zombie from the previous gateway process (whose long-poll
-            # hasn't expired server-side yet) or our own previous retry's still-expiring session. Without
-            # this, each retry starts a new getUpdates session that immediately gets 409'd by the previous
-            # one, creating the very conflict we are trying to recover from (#75017).
-            self._polling_conflict_recovery_generation = expected_generation
+            # Keep the server-side queue: drop_pending_updates only empties it (PTB calls deleteWebhook either
+            # way), so True silently discarded every message sent during the conflict (#143871). The
+            # self-perpetuating 409 loop of #75017 is stopped by _disarm_ptb_retry_loop.
             try:
-                await self._start_polling_once(app, drop_pending_updates=True, error_callback=self._polling_error_callback_ref)
+                await self._start_polling_once(app, drop_pending_updates=False, error_callback=self._polling_error_callback_ref)
                 logger.info(
                     "[%s] Telegram polling restarted after conflict retry %d/%d; health pending getUpdates progress",
                     self.name, self._polling_conflict_count, MAX_CONFLICT_RETRIES)
@@ -2455,9 +2413,6 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                     self._restart_polling_in_task(self._handle_polling_conflict(retry_err))
                     return
                 # Fall through to fatal on the last retry.
-            finally:
-                if self._polling_conflict_recovery_generation == expected_generation:
-                    self._polling_conflict_recovery_generation = None
         if self._teardown_started:
             return
         # Retries exhausted — fatal so the runner surfaces it and the user knows to act.
