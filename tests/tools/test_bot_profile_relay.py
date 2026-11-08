@@ -27,3 +27,88 @@ def test_named_sender_uses_own_remote_roster_and_outbox(tmp_path, monkeypatch):
     assert bot_relay.claim_pending_envelopes(root) == []
     section = bot_mode_probe.get_bot_mode_protocol_section(sender, force_refresh=True)
     assert 'Owned remote' in section and 'Foreign remote' not in section
+
+
+def _sender_agent(home):
+    """An agent whose session db sits in ``home`` — the only thing ``_agent_home`` reads."""
+    from types import SimpleNamespace as _NS
+
+    return _NS(_session_db=_NS(db_path=str(home / 'state.db')), _session_title_hint='Bot Chat')
+
+
+def _spy_delivery(monkeypatch):
+    commands = []
+    monkeypatch.setattr(bot_mode_dm, '_spawn_delivery', lambda command, *a, **kw:
+                        commands.append(command) or json.dumps({'status': 'sent'}))
+    return commands
+
+
+def test_named_profile_falls_back_to_the_machine_root_relay(tmp_path, monkeypatch):
+    """A named profile's home holds no relay folder — the Desktop only ever writes the machine
+    root — so a cross-device DM must resolve against the root roster and queue there. Without the
+    fallback the sender reports "No teammate named ..." for a row the root roster lists."""
+    root = tmp_path / 'state'
+    sender = root / 'profiles' / 'sender'
+    sender.mkdir(parents=True)
+    (sender / 'profile.yaml').write_text('ui_meta:\n  hermes-bots:\n    shape: cloud\n')
+    bot_relay.write_remote_roster(root, [dict(profile='remote', handle='remote',
+                                              connection_id='homelab', title='Homelab bot')])
+    assert bot_relay.read_remote_roster(sender) == []  # nothing profile-local to resolve against
+    _spy_delivery(monkeypatch)
+
+    result = json.loads(bot_mode_dm.message_agent_tool('remote@homelab', 'hello', agent=_sender_agent(sender)))
+    assert result.get('status') == 'sent', result
+    envelopes = bot_relay.claim_pending_envelopes(root)
+    assert len(envelopes) == 1 and envelopes[0]['target_connection'] == 'homelab'
+    assert envelopes[0]['message'] == 'Message from 🤖 sender (@sender): hello'
+    assert bot_relay.claim_pending_envelopes(sender) == []
+
+
+def test_root_fallback_covers_a_bare_target_too(tmp_path, monkeypatch):
+    """The same fallback at the unknown/same-name call site: a bare handle that no local profile
+    answers to still resolves against the root roster (replies are addressed by handle)."""
+    root = tmp_path / 'state'
+    sender = root / 'profiles' / 'sender'
+    sender.mkdir(parents=True)
+    (sender / 'profile.yaml').write_text('ui_meta:\n  hermes-bots:\n    shape: cloud\n')
+    bot_relay.write_remote_roster(root, [dict(profile='remote', handle='remote',
+                                              connection_id='homelab', title='Homelab bot')])
+    _spy_delivery(monkeypatch)
+
+    result = json.loads(bot_mode_dm.message_agent_tool('remote', 'hello', agent=_sender_agent(sender)))
+    assert result.get('status') == 'sent', result
+    envelopes = bot_relay.claim_pending_envelopes(root)
+    assert len(envelopes) == 1 and envelopes[0]['target_connection'] == 'homelab'
+
+
+def test_profile_local_relay_roster_still_wins(tmp_path, monkeypatch):
+    """A profile-local roster that resolves the target stays authoritative: the fallback must
+    never re-route a DM the sender's own folder can deliver (that is how the default relays a
+    named bot's DM as the default)."""
+    root = tmp_path / 'state'
+    sender = root / 'profiles' / 'sender'
+    sender.mkdir(parents=True)
+    (sender / 'profile.yaml').write_text('ui_meta:\n  hermes-bots:\n    shape: cloud\n')
+    bot_relay.write_remote_roster(sender, [dict(profile='remote', handle='remote', connection_id='own')])
+    bot_relay.write_remote_roster(root, [dict(profile='remote', handle='remote', connection_id='own'),
+                                         dict(profile='remote', handle='remote', connection_id='homelab')])
+    _spy_delivery(monkeypatch)
+
+    result = json.loads(bot_mode_dm.message_agent_tool('remote@own', 'hello', agent=_sender_agent(sender)))
+    assert result.get('status') == 'sent', result
+    envelopes = bot_relay.claim_pending_envelopes(sender)
+    assert len(envelopes) == 1 and envelopes[0]['target_connection'] == 'own'
+    assert bot_relay.claim_pending_envelopes(root) == []
+
+
+def test_genuine_miss_keeps_the_roster_error(tmp_path, monkeypatch):
+    """No row anywhere: the sender still gets today's roster error, not a silent success."""
+    root = tmp_path / 'state'
+    sender = root / 'profiles' / 'sender'
+    sender.mkdir(parents=True)
+    (sender / 'profile.yaml').write_text('ui_meta:\n  hermes-bots:\n    shape: cloud\n')
+    bot_relay.write_remote_roster(root, [dict(profile='remote', handle='remote', connection_id='homelab')])
+    _spy_delivery(monkeypatch)
+
+    result = json.loads(bot_mode_dm.message_agent_tool('nobody@nowhere', 'hello', agent=_sender_agent(sender)))
+    assert 'error' in result and 'No teammate named' in result['error'], result
