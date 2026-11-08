@@ -340,4 +340,48 @@ async def recover_webhook_finalizations(authority):
                 authority, authority._receipt(row)) else 'unchanged'
         except (KeyError, RuntimeStoreError):
             results[sid] = 'unavailable'
+    await recover_bot_chat_finals(authority)
     return results
+
+
+async def recover_bot_chat_finals(authority):
+    """Retry committed original Bot Chat finals, including already closed source sessions.
+
+    Called at boot and after hot-serve, not on housekeeping ticks. A later restart retries
+    unavailable owners; native receipts fence retries without rerunning the source turn.
+    """
+    import logging
+    from gateway.session_authorities import active_authority
+    from gateway.session_envelope import restore_native
+    from gateway.platforms.webhook_bot_chat import deliver_settled
+    from hermes_state_runtime import get_session_admission
+
+    if active_authority(authority.runner) is not authority:
+        return
+
+    def candidates():
+        return authority.db._read_all("""
+            SELECT a.admission_id FROM session_admissions AS a
+            JOIN sessions AS s ON s.id=a.target_session_id
+            WHERE s.source='webhook' AND a.status='terminal' AND a.outcome='completed'
+              AND json_extract(a.payload_json, '$.native_text_v1.source.platform')='webhook'
+              AND json_extract(a.payload_json, '$.native_text_v1.automation') IS NULL
+              AND json_extract(a.payload_json, '$.native_text_v1.webhook_delivery.deliver')='bot-chat'
+            """)
+
+    def restore(admission_id):
+        row = get_session_admission(authority.db, admission_id=admission_id)
+        event = restore_native(row['payload'], authority.runner)
+        return event, authority.runner._adapter_for_source(event.source)
+
+    for row in await asyncio.to_thread(candidates):
+        try:
+            event, adapter = await asyncio.to_thread(restore, row['admission_id'])
+            if adapter is not None:
+                result = await deliver_settled(authority, adapter, event, row['admission_id'])
+                if result is not None:
+                    logging.getLogger(__name__).info(
+                        'Recovered webhook Bot Chat source=%s receipt=%s status=%s',
+                        row['admission_id'], result.message_id, (result.raw_response or {}).get('status', 'unavailable'))
+        except (KeyError, ValueError, RuntimeStoreError):
+            continue  # retained source is not authority to bypass current routing

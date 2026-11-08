@@ -6,6 +6,18 @@ import json
 from hermes_state_runtime import RuntimeStoreError
 
 
+def validate_bot_chat_route(route):
+    """Refuse unsupported webhook Bot Chat addressing and execution modes."""
+    target = route.get('deliver')
+    if not isinstance(target, str) or not (target == 'bot-chat' or target.startswith('bot-chat:')):
+        return
+    if target != 'bot-chat':
+        raise ValueError('bot-chat only supports the route profile, not an explicit target')
+    for field in ('deliver_only', 'coalesce', 'cron_job', 'mirror_to_session', 'deliver_extra'):
+        if route.get(field):
+            raise ValueError(f'bot-chat does not support {field}')
+
+
 def route_digest(adapter, chat_id):
     from gateway.platforms.webhook import _WebhookDeliveryIdentity
     adapter._reload_dynamic_routes()
@@ -16,6 +28,10 @@ def route_digest(adapter, chat_id):
     route = adapter._routes.get(route_name)
     if route is None:
         raise RuntimeStoreError('not_found')
+    try:
+        validate_bot_chat_route(route)
+    except ValueError:
+        raise RuntimeStoreError('invalid_params') from None
     return hashlib.sha256(json.dumps(route, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
@@ -31,6 +47,11 @@ def validate_destination(delivery):
     target, extra = delivery['deliver'], delivery['deliver_extra']
     if not isinstance(target, str) or not isinstance(extra, dict):
         raise RuntimeStoreError('invalid_params')
+    if target == 'bot-chat':
+        if extra or delivery.get('mirror') or not delivery.get('route'):
+            raise RuntimeStoreError('invalid_params')
+        return {key: deepcopy(delivery[key]) for key in ('deliver', 'deliver_extra', 'profile', 'route')
+                if key in delivery and delivery[key] is not None}
     if target == 'github_comment':
         repo, number = extra.get('repo'), extra.get('pr_number')
         if not isinstance(repo, str) or not _REPO_RE.fullmatch(repo) or not str(number).isdigit() or int(number) <= 0:
@@ -58,7 +79,7 @@ def snapshot_destination(adapter, delivery):
     from gateway.config import Platform
 
     result = validate_destination(delivery)
-    if result['deliver'] not in {'log', 'github_comment'} and not result['deliver_extra'].get('chat_id'):
+    if result['deliver'] not in {'log', 'github_comment', 'bot-chat'} and not result['deliver_extra'].get('chat_id'):
         profile = result.get('profile')
         with adapter._profile_scope(profile):
             home = adapter._delivery_config(profile).get_home_channel(Platform(result['deliver']))

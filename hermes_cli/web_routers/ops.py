@@ -212,6 +212,13 @@ async def create_webhook(body: WebhookCreate, profile: Optional[str] = None):
             status_code=400, detail="Direct delivery requires a real target (telegram, discord, …), not 'log'.",
         )
 
+    from gateway.platforms.webhook_delivery import validate_bot_chat_route
+    try:
+        validate_bot_chat_route({'deliver': body.deliver, 'deliver_only': body.deliver_only,
+                                 'deliver_extra': {'chat_id': body.deliver_chat_id} if body.deliver_chat_id else {}})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     def _snapshot():
         subscriptions = wh._load_subscriptions()
         return subscriptions.get(name, wh._MISSING_SUBSCRIPTION)

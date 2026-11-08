@@ -16,10 +16,10 @@ from tests.gateway.fixtures.webhook_route_authority import mount_authority
 
 
 @asynccontextmanager
-async def settled_before_finalizer(*, compress=False):
+async def settled_before_finalizer(*, compress=False, deliver="log"):
     config = PlatformConfig(enabled=True, extra={
         "secret": "owned-secret",
-        "routes": {"fixture": {"prompt": "{text}", "deliver": "log"}},
+        "routes": {"fixture": {"prompt": "{text}", "deliver": deliver}},
     })
     adapter = WebhookAdapter(config)
     app = web.Application()
@@ -67,6 +67,7 @@ async def settled_before_finalizer(*, compress=False):
             admission_id=row["admission_id"],
             generation=claimed["generation"],
             outcome="completed",
+            result={"result": {"final_response": "committed answer", "messages": []}, "usage": {}},
         )
         # Crash after the durable settlement but before the process-local finalizer.
         for task in list(adapter._background_tasks):

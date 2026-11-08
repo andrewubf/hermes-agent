@@ -464,7 +464,19 @@ async def deliver_settled(authority, admission_id):
     delivered = False
     try:
         with await _execution_scope(authority, home):
-            delivered = await deliver_response(adapter, event, session_key, response)
+            bot_result = None
+            if event.source.platform.value == 'webhook':
+                from gateway.platforms.webhook_bot_chat import deliver_settled as deliver_webhook_final
+                bot_result = await deliver_webhook_final(authority, adapter, event, admission_id)
+            if bot_result is None:
+                delivered = await deliver_response(adapter, event, session_key, response)
+            else:
+                delivered = bot_result.success
+                if bot_result.raw_response:
+                    logger.info('Webhook Bot Chat source=%s receipt=%s status=%s', admission_id,
+                                bot_result.message_id, bot_result.raw_response.get('status'))
+                if not delivered:
+                    logger.warning('Webhook Bot Chat handoff failed: %s', bot_result.error)
     except Exception:
         logger.exception('Delivery of settled admission %s failed', admission_id)
     finally:
