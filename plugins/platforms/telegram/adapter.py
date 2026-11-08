@@ -187,6 +187,7 @@ from plugins.platforms.telegram.telegram_resolved_prompt import edit_keeping_pro
 from plugins.platforms.telegram.telegram_topic_transfer import TopicTransferFn, apply_root_dm_topic_transfer
 from plugins.platforms.telegram.telegram_network import (
     SEED_FALLBACK_IPS, TelegramFallbackTransport, discover_fallback_ips, parse_fallback_ip_env, tcp_keepalive_socket_options)
+from plugins.platforms.telegram.telegram_group_observe import shared_sender_suffix, apply_group_observe_attribution
 from plugins.platforms.telegram.telegram_topic_routing import TelegramTopicRoutingMixin
 from utils import env_float, env_int
 
@@ -6203,7 +6204,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
 
     def _telegram_group_observe_shared_source(self, source):
         """Return a chat/topic-scoped source for observed Telegram group context."""
-        return dataclasses.replace(source, user_id=None, user_name=None, user_id_alt=None)
+        return dataclasses.replace(source, user_id=None, user_name=None, user_id_alt=None, shared_session=True)
 
     def _telegram_group_observe_attributed_text(self, event: MessageEvent) -> str:
         user_id = event.source.user_id or "unknown"
@@ -6221,23 +6222,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             "and use observed context only when the current message asks for it.")
 
     def _apply_telegram_group_observe_attribution(self, event: MessageEvent) -> MessageEvent:
-        """Align triggered group turns with observed-history attribution."""
-        if not self._telegram_observe_unmentioned_group_messages():
-            return event
-        raw_message = getattr(event, "raw_message", None)
-        if not raw_message or not self._is_group_chat(raw_message):
-            return event
-        allowed = self._telegram_observe_allowed_chats()
-        if not allowed or self._chat_id_str(raw_message) not in allowed:
-            return event
-        observe_prompt = self._telegram_group_observe_channel_prompt()
-        channel_prompt = f"{event.channel_prompt}\n\n{observe_prompt}" if event.channel_prompt else observe_prompt
-        if event.message_type == MessageType.COMMAND:
-            # Commands keep the original source (user_id) so _check_slash_access can identify the sender.
-            return dataclasses.replace(event, channel_prompt=channel_prompt)
-        return dataclasses.replace(
-            event, text=self._telegram_group_observe_attributed_text(event),
-            source=self._telegram_group_observe_shared_source(event.source), channel_prompt=channel_prompt)
+        return apply_group_observe_attribution(self, event)
 
     def _media_message_type(self, msg: Message) -> MessageType:
         """Classify a Telegram media message into a MessageType (first present attachment wins)."""
@@ -6566,7 +6551,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
     def _text_batch_key(self, event: MessageEvent) -> str:
         """Session-scoped batching key; topic recovery first so DM-topic batches coalesce on the recovered lane."""
         self._apply_topic_recovery(event)
-        return super()._text_batch_key(event)
+        return super()._text_batch_key(event) + shared_sender_suffix(event)
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text chunk, or hold it while delayed delivery must be dropped."""
@@ -6645,6 +6630,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         """Return a batching key for Telegram photos/albums."""
         session_key = self._event_session_key(event)
         media_group_id = getattr(msg, "media_group_id", None)
+        session_key += shared_sender_suffix(event)
         return f"{session_key}:album:{media_group_id}" if media_group_id else f"{session_key}:photo-burst"
 
     async def _flush_photo_batch(self, batch_key: str) -> None:
@@ -7146,6 +7132,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         return MessageEvent(
             text=expand_link_entities(message), message_type=msg_type, source=source, raw_message=message,
             message_id=str(message.message_id), platform_update_id=update_id,
+            user_id=source.user_id, user_name=source.user_name,
             reply_to_message_id=reply_to_id, reply_to_text=reply_to_text, auto_skill=topic_skill,
             channel_prompt=group_identity_prompt(self, message, channel_prompt), reply_expected=group_reply_expected(self, message, chat_type),
             edit_revision=self._edit_revision(message, update_id), timestamp=message.date)
