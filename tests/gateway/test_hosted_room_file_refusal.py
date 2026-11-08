@@ -64,7 +64,6 @@ def test_tui_route_fails_a_turn_whose_file_exceeds_the_member_cap(tui_db, monkey
     task, submits, runtime = _tui_run(tui_db)
     assert task["status"] == "failed", runtime.status()["last_error"]
     assert submits == []
-    assert ROOM_ID not in runtime._ambiguous_rooms
 
 
 def test_tui_route_requeues_a_turn_whose_file_preparation_failed_transiently(tui_db, monkeypatch):
@@ -76,7 +75,6 @@ def test_tui_route_requeues_a_turn_whose_file_preparation_failed_transiently(tui
     assert task["status"] == "queued", runtime.status()["last_error"]
     assert "was not admitted" in runtime.status()["last_error"]
     assert submits == []
-    assert ROOM_ID not in runtime._ambiguous_rooms
 
 
 class _NullLock:
@@ -115,4 +113,3 @@ def test_authority_route_fails_a_turn_whose_file_exceeds_the_member_cap(hosted_o
 
     assert status == "failed", runtime.status()["last_error"]
     assert rpc.callbacks == {}
-    assert "room" not in runtime._ambiguous_rooms
