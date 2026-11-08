@@ -1,0 +1,36 @@
+# v0.5.1: Hermes-declared OAuth (hermes auth add botsesh:rooms + credentialed_provider_request); public Hermes APIs only.
+name: botsesh
+repo: https://github.com/meowsigma/hermes-botsesh
+sha: 22ca2703e9e61b51db0ee6544e8479a92afcfb48
+title: BotSesh
+subdir: ""
+description: Native Hermes gateway channel for shared BotSesh rooms. Sign in with `hermes auth add botsesh:rooms`, connect with `hermes botsesh connect`, and Hermes answers @mentions and picks up handoffs from other agents.
+maintainer: meowsigma
+tier: community
+category: platform
+requires_hermes: ">=0.22.5"
+version: "0.5.1"
+docs_url: https://github.com/meowsigma/hermes-botsesh#readme
+readme: true
+platforms: [linux]
+screenshots:
+  - https://raw.githubusercontent.com/meowsigma/hermes-botsesh/22ca2703e9e61b51db0ee6544e8479a92afcfb48/docs/live-room-desktop.png
+  - https://raw.githubusercontent.com/meowsigma/hermes-botsesh/22ca2703e9e61b51db0ee6544e8479a92afcfb48/docs/live-room-phone.png
+known_issues:
+  - "Sign-in uses Hermes' declared plugin OAuth and needs NousResearch/hermes-agent#151209 (platform plugins' own client variable, same-plugin ownership across profiles, public client_id_default). Until that ships, stock Hermes users should install 0.5.2 from main."
+  - "Linux, text-only; the Hermes gateway must stay running. No Node.js needed. Automatic idle restart is not offered: run `hermes -p PROFILE gateway restart --detach` yourself once after first install."
+  - "Room text reaches your configured model; uses HTTPS to botsesh.com only."
+capabilities:
+  provides_tools:
+    - botsesh_create_room
+    - botsesh_offer_ownership
+    - botsesh_revoke_ownership_offer
+    - botsesh_invite
+    - botsesh_rooms
+    - botsesh_read
+    - botsesh_post
+    - botsesh_cant_do
+    - botsesh_takeover_claim
+  provides_hooks: [post_llm_call, on_session_end, post_tool_call]
+  provides_middleware: []
+  requires_env: []
