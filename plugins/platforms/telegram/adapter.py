@@ -590,6 +590,11 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         self._seen_update_ids: dict = {}
         self._inflight_update_ids: dict = {}
         self._update_admission = None
+        # Telegram rich-message sidecar: the Bot API carries block content (paragraphs, tables,
+        # photos) in message.rich_message ONLY, with legacy text/photo fields empty, and PTB 22.8
+        # drops the unknown field when parsing. We stash the raw payload here at the wire-observation
+        # layer (keyed "chat_id:message_id") so a dedicated handler can render it (2026-11-08).
+        self._rich_message_sidecar: dict = {}
         # Completed update IDs survive adapter replacement and restarts (update_admission.py).
         # Resolved now: secondary profiles construct adapters inside their own home scope.
         from hermes_constants import get_hermes_home
@@ -1478,15 +1483,22 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             retryable=(self._looks_like_connect_timeout(exc) or not self._is_timed_out(exc)), retry_after=retry_after)
 
     @staticmethod
-    async def _record_rich_sent(chat_id: Any, message_id: Any, content: str) -> None:
-        """Index rich content we sent: Telegram won't echo it back in reply_to_message.
+    async def _record_sent_text(chat_id: Any, message_id: Any, content: str) -> None:
+        """Index the text of a message we sent: Telegram does not echo a message body back in
+        ``reply_to_message``, so a later quote-reply can only be resolved from this index.
+
+        Covers BOTH send paths (rich ``sendRichMessage`` and legacy MarkdownV2 ``sendMessage``)
+        and the legacy finalize edit — anything the user can see and quote.
 
         Awaited so the store's read-modify-write + ``os.replace`` runs off the loop."""
         try:
             from gateway import rich_sent_store
             await rich_sent_store.record_async(str(chat_id), str(message_id), content)
         except Exception:
-            pass
+            # The send itself already succeeded — a failed index write must not fail the send.
+            # But stay loud: a broken index silently degrades every future quote-reply.
+            logger.warning("[Telegram] failed to index sent text for quote-reply recovery",
+                           exc_info=True)
 
     async def _try_send_rich(
         self, chat_id: str, content: str, reply_to: Optional[str], metadata: Optional[dict[str, Any]]) -> Optional[SendResult]:
@@ -1527,7 +1539,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         else:
             message_id = getattr(msg, "message_id", None)
         if message_id is not None:
-            await self._record_rich_sent(chat_id, message_id, content)
+            await self._record_sent_text(chat_id, message_id, content)
         return SendResult(success=True, message_id=str(message_id) if message_id is not None else None)
 
     def _rich_payload_base(self, chat_id: str, content: str) -> dict[str, Any]:
@@ -1566,7 +1578,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 return None
             return self._rich_transient_result(exc, "rich editMessageText")
         # Mirror the fresh-send index: a streamed final finalized via edit is otherwise never recorded.
-        await self._record_rich_sent(chat_id, message_id, content)
+        await self._record_sent_text(chat_id, message_id, content)
         return SendResult(success=True, message_id=message_id)
 
     def _should_attempt_rich_draft(self, content: str) -> bool:
@@ -1737,6 +1749,20 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         except Exception:
             return
         if isinstance(envelope, dict) and envelope.get("ok") is True and "result" in envelope:
+            # Stash rich-message payloads BEFORE the generation gate: the Bot API delivers block
+            # content ONLY in message.rich_message (legacy text/photo fields stay empty) and PTB
+            # 22.8 drops the unknown field when parsing, so without this such updates match no
+            # handler and ghost through dispatch. PTB still hands fenced-generation responses to
+            # the dying app, so gating the stash behind generation progress would miss exactly the
+            # rebuild windows where updates are lost (#146067).
+            for upd in envelope.get("result") or []:
+                if not isinstance(upd, dict):
+                    continue
+                msg = upd.get("message")
+                rich = msg.get("rich_message") if isinstance(msg, dict) else None
+                if isinstance(rich, dict) and isinstance(rich.get("blocks"), list):
+                    self._rich_message_sidecar[
+                        f"{(msg.get('chat') or {}).get('id')}:{msg.get('message_id')}"] = rich
             if self._record_polling_progress(generation):
                 self._record_updates_received(envelope.get("result"))
 
@@ -1783,7 +1809,18 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             raise _PollingLifecycleAbort("Telegram polling teardown started")
 
         def _generation_error_callback(error: Exception) -> None:
-            if self._teardown_started or generation != self._polling_generation or error_callback is None:
+            if self._teardown_started:
+                return
+            if generation != self._polling_generation:
+                # A handler exception landing while a polling rebuild is in flight was
+                # discarded silently — that window is exactly when media downloads (network
+                # dependent) are most likely to fail. Record it; the old generation's errors
+                # can no longer be acted on, but the traceback is diagnostic gold.
+                logger.warning("[%s] handler error during polling-generation rebuild (gen=%s current=%s): %s",
+                               self.name, generation, self._polling_generation,
+                               _redact_telegram_error_text(error), exc_info=error)
+                return
+            if error_callback is None:
                 return
             callback_context_token = _POLLING_GENERATION_CONTEXT.set(None)
             try:
@@ -2900,6 +2937,25 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         """Register every PTB handler on ``app`` (initial connect and the transient-init rebuild)."""
         table = getattr(app, "handlers", None)
         core_before = {g: len(hs) for g, hs in table.items()} if isinstance(table, dict) else {}
+        adapter_self = self
+
+        class _RichGhostFilter(filters.MessageFilter):
+            """Match rich-message updates whose legacy content fields are empty — the exact
+            signature PTB filters otherwise reject (message.rich_message is dropped by PTB 22.8,
+            so the raw payload waits in the adapter sidecar)."""
+
+            def filter(self, message):
+                # PTB 22 renamed the hook: MessageFilter.filter(message) — defining the old
+                # check() silently never matches (abstract filter() is not enforced).
+                key = f"{message.chat_id}:{message.message_id}"
+                if key not in adapter_self._rich_message_sidecar:
+                    return False
+                legacy = (message.text or message.caption or message.photo or message.document
+                          or message.video or message.audio or message.voice or message.sticker
+                          or message.location or message.poll)
+                return not legacy
+
+        app.add_handler(TelegramMessageHandler(_RichGhostFilter(), self._handle_rich_message))
         app.add_handler(TelegramMessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text_message))
         app.add_handler(TelegramMessageHandler(filters.COMMAND, self._handle_command))
         app.add_handler(TelegramMessageHandler(
@@ -3742,6 +3798,11 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 return self._with_partial_send(outcome, chunks[len(delivered) - prior:], delivered)
             msg, used_thread_fallback = outcome
             delivered.append(str(msg.message_id))
+            # Index what we sent: Telegram does not echo a message body back in
+            # ``reply_to_message``, so a later quote-reply resolves ONLY through this index.
+            # The legacy MarkdownV2 path carries ~95% of outbound messages — without this
+            # write their quoted text is unrecoverable and the agent answers blind.
+            await self._record_sent_text(chat_id, msg.message_id, _strip_mdv2(chunk))
         await self._retrigger_typing(chat_id, metadata)
         return SendResult(
             success=True, message_id=delivered[0] if delivered else None,
@@ -3910,6 +3971,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             await self._edit_markdown_or_plain(
                 chat_id, message_id, self.format_message(content), _strip_mdv2(content) if content else content,
                 "[%s] MarkdownV2 edit failed, falling back to plain text: %s")
+            # The finalized text is what the user sees and quotes — keep it resolvable.
+            await self._record_sent_text(chat_id, message_id, _strip_mdv2(content) if content else "")
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
             err_str = str(e).lower()
@@ -6818,8 +6881,101 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             await self._surface_media_cache_failure(msg, event, "attachment", e, display_name=getattr(doc, "file_name", None) or None)
         return False
 
+    async def _handle_rich_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle Telegram rich messages (block format: paragraphs, tables, photos). The Bot API
+        delivers their content ONLY in message.rich_message with empty legacy fields, and PTB 22.8
+        drops that field when parsing — without this handler such updates ghost through dispatch
+        (2026-11-08). Render blocks to text, download photo blocks, deliver one MessageEvent."""
+        msg = update.message
+        if not msg:
+            return
+        key = f"{msg.chat_id}:{msg.message_id}"
+        rich = self._rich_message_sidecar.pop(key, None)
+        if not isinstance(rich, dict):
+            return
+        logger.info("[%s] Rich inbound: update=%s msg=%s chat=%s blocks=%d",
+                    self.name, update.update_id, msg.message_id, msg.chat.id if msg.chat else "?",
+                    len(rich.get("blocks") or []))
+        if not self._is_user_authorized_from_message(msg):
+            self._log_blocked_user(msg, level=logging.INFO, what="rich message from unauthorized user")
+            return
+        if not self._should_process_message(msg):
+            return
+        event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
+        text_parts: list = []
+        photo_file_ids: list = []
+        for block in rich.get("blocks") or []:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "paragraph":
+                text = (block.get("text") or "").strip()
+                if text:
+                    text_parts.append(text)
+            elif btype == "table":
+                rows = []
+                for row in block.get("cells") or []:
+                    cells = [(str(c.get("text") or "").strip() if isinstance(c, dict) else "") for c in (row or [])]
+                    rows.append("| " + " | ".join(cells) + " |")
+                if rows:
+                    text_parts.append("\n".join(rows))
+                caption = block.get("caption")
+                if isinstance(caption, dict) and caption.get("text"):
+                    text_parts.append(f"**{caption['text']}**")
+            elif btype == "photo":
+                sizes = block.get("photo") or []
+                file_id = sizes[-1].get("file_id") if sizes and isinstance(sizes[-1], dict) else None
+                if file_id:
+                    photo_file_ids.append(file_id)
+                    text_parts.append("[изображение]")
+            else:
+                text_parts.append(f"[блок: {btype}]")
+        event.text = "\n".join(text_parts)
+        event = self._apply_telegram_group_observe_attribution(event)
+        cached_paths: list = []
+        for file_id in photo_file_ids:
+            try:
+                file_obj = await context.bot.get_file(file_id)
+                image_bytes = await file_obj.download_as_bytearray()
+                ext = self._ext_from_path(file_obj.file_path, [".png", ".webp", ".gif", ".jpeg", ".jpg"], ".jpg")
+                path = await cache_image_from_bytes_async(bytes(image_bytes), ext=ext)
+                cached_paths.append((path, f"image/{ext.lstrip('.')}"))
+                logger.info("[Telegram] Cached rich-message photo at %s", path)
+            except Exception as e:
+                logger.warning("[Telegram] Failed to cache rich-message photo: %s", _redact_telegram_error_text(e), exc_info=True)
+        if len(cached_paths) == 1:
+            self._set_cached_media(event, cached_paths[0][0], cached_paths[0][1], MessageType.PHOTO,
+                                   "[Telegram] Rich photo attached at %s")
+        elif cached_paths:
+            event.media_urls = [p for p, _ in cached_paths]
+            event.media_types = [m for _, m in cached_paths]
+            event.message_type = MessageType.PHOTO
+        await self.handle_message(event)
+
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming media messages, downloading images to local cache."""
+        msg = update.message
+        if not msg:
+            return
+        # Always-on receipt: a confirmed-but-never-logged media update is otherwise
+        # indistinguishable from "user never sent it" (2026-11-07: a photo+caption
+        # message was acked by the poller and left no trace anywhere downstream).
+        logger.info("[%s] Media inbound: update=%s msg=%s chat=%s kind=%s caption_chars=%d",
+                    getattr(self, "name", "?"), getattr(update, "update_id", None),
+                    getattr(msg, "message_id", None), getattr(getattr(msg, "chat", None), "id", None),
+                    self._media_message_type(msg).value if hasattr(self._media_message_type(msg), "value") else self._media_message_type(msg),
+                    len(msg.caption or ""))
+        try:
+            await self._handle_media_message_body(update, context)
+        except Exception:
+            # Never let a media update die silently: PTB routes handler exceptions to the
+            # error callback, which a polling-generation rebuild discards by design — the
+            # traceback below is the only guaranteed record.
+            logger.exception("[%s] Unhandled exception in media handler (msg=%s chat=%s)",
+                             self.name, msg.message_id, msg.chat.id if msg.chat else "?")
+            raise
+
+    async def _handle_media_message_body(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.message
         if not msg:
             return
@@ -7096,6 +7252,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             try:
                 from gateway import rich_sent_store
                 reply_to_text = rich_sent_store.lookup(str(message.chat.id), reply_to_id)
+                if reply_to_text:
+                    # A message that gets quoted is worth keeping: refresh its timestamp so the
+                    # FIFO trim does not evict it while the conversation still refers to it.
+                    rich_sent_store.touch(str(message.chat.id), reply_to_id)
             except Exception:
                 # Extract reply context if this message is a reply. Prefer Telegram's native partial quote
                 # (message.quote, TextQuote) so a user replying to a single selected substring of a prior
@@ -7104,6 +7264,13 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 # didn't quote (#22619). Fall back to the full replied-to message text / caption when no
                 # native quote is present.
                 reply_to_text = None
+        if not reply_to_text:
+            # The quoted body is unrecoverable: Telegram echoed nothing and the sent index has no
+            # entry. Say so — a silently dropped quote makes the agent answer a question whose
+            # subject it cannot see, and nothing in the logs shows why.
+            logger.warning(
+                "[%s] reply_to_id=%s carries no recoverable text: Telegram echoed no body and the sent index has no entry",
+                self.name, reply_to_id)
         return reply_to_id, reply_to_text
 
     def _build_message_event(self, message: Message, msg_type: MessageType, update_id: Optional[int] = None) -> MessageEvent:
