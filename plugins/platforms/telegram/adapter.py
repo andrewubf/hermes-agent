@@ -182,6 +182,7 @@ _MEDIA_KIND_KEYS = {
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from plugins.platforms.telegram.telegram_entities import expand_link_entities
 from plugins.platforms.telegram.telegram_held_inbound import TelegramHeldInboundMixin
+from plugins.platforms.telegram.telegram_intake import effective_update_message
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id, parse_send_target, parse_telegram_message_id
 from plugins.platforms.telegram.telegram_resolved_prompt import edit_keeping_prompt
 from plugins.platforms.telegram.telegram_topic_transfer import TopicTransferFn, apply_root_dm_topic_transfer
@@ -190,7 +191,7 @@ from plugins.platforms.telegram.telegram_network import (
 from plugins.platforms.telegram.telegram_topic_routing import TelegramTopicRoutingMixin
 from utils import env_float, env_int
 
-_TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+_TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".heic", ".heif", ".avif"}
 # Max seconds a send/edit may sleep inline on a flood-control RetryAfter; longer penalties fail
 # closed with ``flood_control:{wait}`` so the caller's retry machinery owns the wait.
 # Longer server penalties fail closed with a ``flood_control:{wait}`` SendResult so the caller's retry
@@ -213,8 +214,8 @@ def _flood_cap_result(wait: float) -> SendResult:
     return SendResult(success=False, error=f"flood_control:{wait}", retry_after=float(wait))
 
 
-_TELEGRAM_IMAGE_MIME_TO_EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}
-_TELEGRAM_IMAGE_EXT_TO_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif"}
+_TELEGRAM_IMAGE_EXT_TO_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif", ".heic": "image/heic", ".heif": "image/heif", ".avif": "image/avif"}
+_TELEGRAM_IMAGE_MIME_TO_EXT = {"image/jpg": ".jpg", **{m: e for e, m in _TELEGRAM_IMAGE_EXT_TO_MIME.items() if e != ".jpeg"}}
 
 
 def _coerce_duration_seconds(value: Any) -> Optional[int]:
@@ -6469,9 +6470,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             except Exception as e:
                 logger.warning("[%s] Forum command lazy-registration failed: %s", self.name, _redact_telegram_error_text(e))
 
-    def _effective_update_message(self, update: Update) -> Optional[Message]:
-        """Message-like payload for normal messages and channel posts (``update.channel_post``)."""
-        return getattr(update, "effective_message", None) or getattr(update, "message", None)
+    _effective_update_message = staticmethod(effective_update_message)
 
     def _log_blocked_user(self, msg, *, level=logging.WARNING, what: str = "unauthorized user") -> None:
         logger.log(
@@ -6820,7 +6819,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
 
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming media messages, downloading images to local cache."""
-        msg = update.message
+        msg = self._effective_update_message(update)  # channel posts arrive as update.channel_post
         if not msg:
             return
         if not self._is_user_authorized_from_message(msg):
