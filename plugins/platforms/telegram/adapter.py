@@ -5982,9 +5982,13 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
     _BOT_IDENTITY_PROBE_TIMEOUT = 15.0
 
     def _is_reply_to_bot(self, message: Message) -> bool:
-        if not self._bot or not getattr(message, "reply_to_message", None):
+        replied, thread_id = getattr(message, "reply_to_message", None), getattr(message, "message_thread_id", None)
+        # Every plain post in a forum topic "replies" to the topic's creation message (id == thread id);
+        # a bot-created topic's anchor is not a reply to the bot (#118678).
+        if not self._bot or not replied or (getattr(replied, "forum_topic_created", None) is not None
+                                            and thread_id is not None and getattr(replied, "message_id", None) == thread_id):
             return False
-        reply_user = getattr(message.reply_to_message, "from_user", None)
+        reply_user = getattr(replied, "from_user", None)
         return bool(reply_user and getattr(reply_user, "id", None) == getattr(self._bot, "id", None))
 
     @staticmethod
@@ -6117,19 +6121,19 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             task.add_done_callback(tracked.discard)
 
     def _explicit_bot_mentions_exclude_self(self, message: Message) -> bool:
-        """True when explicit bot handles target other bots, not this one (``@bot3 hi @bot4`` must not
-        wake ``@bot1`` via reply/wake-word fallbacks)."""
-        if not self._bot:
-            return False
-        bot_username = self._current_bot_username()
+        """True when the message is addressed (leading handles) to other bots and names us nowhere; a
+        foreign handle later in the text only talks about that bot (#136236)."""
+        bot_username = self._current_bot_username() if self._bot else None
         if not bot_username:
             return False
-        mentioned_bot_usernames = self._extract_bot_mention_usernames(message, bot_username)
-        excludes_self = bool(mentioned_bot_usernames) and bot_username not in mentioned_bot_usernames
-        if excludes_self:
-            # Either truly for another bot, or our handle is stale after a rename — re-check out of band.
-            self._schedule_bot_identity_recheck()
-        return excludes_self
+        from plugins.platforms.telegram.telegram_addressing import leading_bot_handles
+        addressed = leading_bot_handles(message, lambda h: h == bot_username or bool(self._FOREIGN_BOT_HANDLE_RE.fullmatch(h)))
+        if not addressed or bot_username in self._extract_bot_mention_usernames(message, bot_username):
+            return False
+        self._schedule_bot_identity_recheck()  # or our handle is stale after a rename: re-check out of band
+        logger.info("[%s] Skipping message %s in chat %s: addressed to other bot(s) %s", self.name,
+                    getattr(message, "message_id", None), self._chat_id_str(message), ", ".join(f"@{h}" for h in sorted(addressed)))
+        return True
 
     def _message_matches_mention_patterns(self, message: Message) -> bool:
         if not self._mention_patterns:
@@ -6144,11 +6148,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         return self._telegram_guest_mode() and self._message_mentions_bot(message)
 
     def _clean_bot_trigger_text(self, text: Optional[str]) -> Optional[str]:
-        bot_username = self._current_bot_username()
-        if not text or not bot_username:
-            return text
-        cleaned = re.sub(rf"(?i)@{re.escape(bot_username)}\b[,:\-]*\s*", "", text).strip()
-        return cleaned or text
+        from plugins.platforms.telegram.telegram_addressing import clean_bot_trigger_text
+        return clean_bot_trigger_text(text, self._current_bot_username())
 
     def _topic_gates_pass(self, thread_id, *, warn_non_numeric: bool) -> Optional[bool]:
         """``allowed_topics`` / ``ignored_threads`` gates; False = blocked, None = undecided."""
@@ -6188,15 +6189,13 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         allowed = self._telegram_observe_allowed_chats()
         if not allowed or chat_id_str not in allowed:
             return False
-        # Free-response chats/topics dispatch every message, so they are never observed.
-        if chat_id_str in self._telegram_free_response_chats() or self._telegram_is_free_response_topic(message):
-            return False
-        # Only observe messages the require_mention gate would skip. The bot-to-bot loop breaker
-        # in ``_should_process_message`` skips another bot's message too, so a sibling bot
-        # addressing us by wake word (or quote-reply) is never dispatched and must still be
-        # kept as observed context (#115119).
+        # Only observe what is NOT dispatched: the bot-to-bot loop breaker skips a sibling bot's wake word or
+        # quote-reply, which must stay observed context (#115119), in free-response chats/topics too (#147623).
         if self._bot_sender_suppressed(message):
             return True
+        # Free-response chats/topics dispatch every other message, so they are never observed.
+        if chat_id_str in self._telegram_free_response_chats() or self._telegram_is_free_response_topic(message):
+            return False
         if not self._telegram_require_mention() or self._is_reply_to_bot(message) or self._message_mentions_bot(message):
             return False
         return not self._message_matches_mention_patterns(message)
@@ -6433,14 +6432,14 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         guest_mention = self._is_guest_mention(message)
         # allowed_chats whitelist: outside chats pass only via the guest-mode explicit mention.
         allowed = self._telegram_allowed_chats()
-        if allowed and chat_id_str not in allowed:
+        if (allowed and chat_id_str not in allowed) or guest_mention:
             return guest_mention
-        if guest_mention or chat_id_str in self._telegram_free_response_chats() or self._telegram_is_free_response_topic(message):
-            return True
-        # Bot-to-bot loop breaker: another bot must explicitly @mention us; its quote-reply or
-        # plain chatter does not count (two bots answering each other's replies never stop otherwise).
+        # Bot-to-bot loop breaker: another bot must explicitly @mention us (quote-replies and chatter don't
+        # count). Before the free-response exemption, which is for humans only (#147623).
         if self._bot_sender_suppressed(message):
             return False
+        if chat_id_str in self._telegram_free_response_chats() or self._telegram_is_free_response_topic(message):
+            return True
         if not self._telegram_require_mention() or self._is_reply_to_bot(message):
             return True
         if not self._telegram_guest_mode() and self._message_mentions_bot(message):
