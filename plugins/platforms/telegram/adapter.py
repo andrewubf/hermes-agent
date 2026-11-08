@@ -148,19 +148,14 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES, SUPPORTED_IMAGE_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS, utf16_len,
 )
 
-# Telegram truncates ``answerCallbackQuery`` text at 200 chars; ``BotCommand`` descriptions at 256.
-_TOAST_LIMIT = 200
-_BOT_COMMAND_DESCRIPTION_LIMIT = 256
+_BOT_COMMAND_DESCRIPTION_LIMIT = 256  # Telegram's ``BotCommand`` description cap
 
 
-def _unauthorized() -> str:
-    """Every refused button tap answers with the same sentence — resolved per tap so the active
-    language applies (never bound at import)."""
+def _unauthorized() -> str:  # one sentence for every refused tap, resolved per tap (never bound at import)
     return unauthorized_action_notice(Platform.TELEGRAM)[:_TOAST_LIMIT]
 
 
-def _toast(key: str, **kwargs: Any) -> str:
-    """``t()`` for ``query.answer(text=...)`` payloads, cut at Telegram's 200-char toast cap."""
+def _toast(key: str, **kwargs: Any) -> str:  # ``t()`` for ``query.answer(text=...)``, cut at the toast cap
     return t(key, **kwargs)[:_TOAST_LIMIT]
 
 
@@ -185,6 +180,7 @@ from plugins.platforms.telegram.telegram_held_inbound import TelegramHeldInbound
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id, parse_send_target, parse_telegram_message_id
 from plugins.platforms.telegram.telegram_resolved_prompt import edit_keeping_prompt
 from plugins.platforms.telegram.telegram_topic_transfer import TopicTransferFn, apply_root_dm_topic_transfer
+from plugins.platforms.telegram.callback_answer import TOAST_LIMIT as _TOAST_LIMIT, answer_callback, answer_or_note
 from plugins.platforms.telegram.telegram_network import (
     SEED_FALLBACK_IPS, TelegramFallbackTransport, discover_fallback_ips, parse_fallback_ip_env, tcp_keepalive_socket_options)
 from plugins.platforms.telegram.telegram_topic_routing import TelegramTopicRoutingMixin
@@ -4372,16 +4368,16 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         """Handle choice picker button taps (cp:<index>)."""
         state = self._choice_picker_state.get(chat_id)
         if not state:
-            await query.answer(text=_toast("platform.telegram.picker.expired_rerun"))
+            await answer_or_note(self, query, _toast("platform.telegram.picker.expired_rerun"))
             return
         try:
             choice = state["choices"][int(data[3:])]
         except (ValueError, IndexError):
-            await query.answer(text=_toast("platform.telegram.picker.invalid_selection"))
+            await answer_callback(query, _toast("platform.telegram.picker.invalid_selection"))
             return
         callback = state.get("on_choice_selected")
         if not callback:
-            await query.answer(text=_toast("platform.telegram.picker.expired"))
+            await answer_or_note(self, query, _toast("platform.telegram.picker.expired"))
             return
         try:
             result_text = await callback(chat_id, str(choice.get("value") or ""))
@@ -4389,7 +4385,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             logger.error("Choice picker selection failed: %s", exc)
             result_text = t("platform.telegram.picker.apply_error", error=str(exc))
         await self._edit_result_text(query, result_text)
-        await query.answer()
+        await answer_callback(query)
         self._choice_picker_state.pop(chat_id, None)
 
     _MODEL_PAGE_SIZE = 8
@@ -4469,10 +4465,14 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             buttons.append(InlineKeyboardButton(short, callback_data=f"mm:{start + i}"))
         return self._paged_keyboard(buttons, page_meta, "mg", self._picker_back_cancel_row())
 
-    async def _picker_edit(self, query, text_md: str, keyboard) -> None:
-        """Re-render the picker message in place (MarkdownV2) and ack the tap."""
-        await query.edit_message_text(text=self.format_message(text_md), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=keyboard)
-        await query.answer()
+    async def _picker_edit(self, query, text_md: str, keyboard, *, toast: Optional[str] = None) -> None:
+        """Ack first, then re-render in place (MarkdownV2): a refused edit must not leave the tap spinning."""
+        from telegram.error import TelegramError
+        await answer_callback(query, toast)
+        try:
+            await query.edit_message_text(text=self.format_message(text_md), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=keyboard)
+        except TelegramError as exc:
+            logger.warning("[%s] model picker re-render failed: %s", self.name, _redact_telegram_error_text(exc))
 
     async def _picker_show_models(self, query, state: dict, page: int) -> None:
         """Render the model page for the provider currently selected in ``state``."""
@@ -4515,15 +4515,15 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         try:
             idx = int(raw_idx)
         except ValueError:
-            await query.answer(text=_toast("platform.telegram.picker.invalid_selection"))
+            await answer_callback(query, _toast("platform.telegram.picker.invalid_selection"))
             return None
         model_list = state.get("model_list", [])
         if idx < 0 or idx >= len(model_list):
-            await query.answer(text=_toast("platform.telegram.picker.invalid_model_index"))
+            await answer_callback(query, _toast("platform.telegram.picker.invalid_model_index"))
             return None
         callback = state.get("on_model_selected")
         if not callback:
-            await query.answer(text=_toast("platform.telegram.picker.expired"))
+            await answer_or_note(self, query, _toast("platform.telegram.picker.expired"))
             return None
         return idx, model_list[idx], state.get("selected_provider", ""), callback
 
@@ -4537,7 +4537,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             result_text = t("platform.telegram.picker.switch_error", error=str(exc))
             switch_failed = True
         await self._edit_result_text(query, result_text)
-        await query.answer(text=_toast("platform.telegram.picker.switch_failed" if switch_failed else "platform.telegram.picker.switched"))
+        await answer_callback(query, _toast("platform.telegram.picker.switch_failed" if switch_failed else "platform.telegram.picker.switched"))
         self._model_picker_state.pop(chat_id, None)
 
     @staticmethod
@@ -4545,21 +4545,21 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         try:
             return int(raw)
         except ValueError:
-            await query.answer(text=_toast("platform.telegram.picker.invalid_page"))
+            await answer_callback(query, _toast("platform.telegram.picker.invalid_page"))
             return None
 
     async def _handle_model_picker_callback(self, query, data: str, chat_id: str) -> None:
         """Handle model picker callbacks (mp:/mpg:/mpv:/mm:/mc:/mb/mx/mg:)."""
         state = self._model_picker_state.get(chat_id)
         if not state:
-            await query.answer(text=_toast("platform.telegram.picker.expired_model"))
+            await answer_or_note(self, query, _toast("platform.telegram.picker.expired_model"))
             return
         get_label = self._provider_get_label()
         if data.startswith("mp:"):  # provider selected: show model buttons (page 0)
             provider_slug = data[3:]
             provider = next((p for p in state["providers"] if p["slug"] == provider_slug), None)
             if not provider:
-                await query.answer(text=_toast("platform.telegram.picker.provider_not_found"))
+                await answer_callback(query, _toast("platform.telegram.picker.provider_not_found"))
                 return
             state["selected_provider"] = provider_slug
             state["selected_provider_name"] = provider.get("name", provider_slug)
@@ -4593,10 +4593,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             if warning is not None:
                 keyboard = InlineKeyboardMarkup([
                     [InlineKeyboardButton(t("platform.telegram.picker.switch_anyway"), callback_data=f"mc:{idx}")], self._picker_back_cancel_row()])
-                await query.edit_message_text(
-                    text=self.format_message(f"⚠ *{warning.title}*\n\n{warning.message}"),
-                    parse_mode=ParseMode.MARKDOWN_V2, reply_markup=keyboard)
-                await query.answer(text=_toast("platform.telegram.picker.confirm_selection"))
+                await self._picker_edit(query, f"⚠ *{warning.title}*\n\n{warning.message}", keyboard,
+                                        toast=_toast("platform.telegram.picker.confirm_selection"))
                 return
             await self._picker_switch(query, chat_id, model_id, provider_slug, callback)
         elif data.startswith("mpg:"):  # provider group selected: show member providers
@@ -4609,7 +4607,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             by_slug = {p["slug"]: p for p in state["providers"]}
             members = [by_slug[m] for m in member_slugs if m in by_slug]
             if not members:
-                await query.answer(text=_toast("platform.telegram.picker.group_not_found"))
+                await answer_callback(query, _toast("platform.telegram.picker.group_not_found"))
                 return
             rows = self._rows_of_two([self._provider_button(p) for p in members])
             rows.append(self._picker_back_cancel_row())
@@ -4623,16 +4621,16 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             await self._picker_show_providers(query, state, int(state.get("provider_page", 0) or 0), get_label)
         elif data == "mx":
             self._model_picker_state.pop(chat_id, None)
-            await query.edit_message_text(text=t("platform.telegram.picker.cancelled"), reply_markup=None)
-            await query.answer()
+            await answer_callback(query)
+            await self._edit_result_text(query, t("platform.telegram.picker.cancelled"))
         else:
-            await query.answer()  # e.g. page-counter button "mx:noop"
+            await answer_callback(query)  # e.g. page-counter button "mx:noop"
 
     async def _notify_clarify_expired(self, query, user_display: str) -> None:
         """Tell the user a clarify tap arrived too late (entry evicted or gateway restarted) — otherwise
         the tap leaves a misleading ✓ the agent never sees."""
         with contextlib.suppress(Exception):
-            await query.answer(text=_toast("platform.telegram.prompt.expired_toast"))
+            await answer_callback(query, _toast("platform.telegram.prompt.expired_toast"))
         await self._edit_html_quiet(
             query, f"❓ {_html.escape(query.message.text or '')}\n\n<i>{_html.escape(t('platform.telegram.prompt.expired_body'))}</i>")
 
@@ -4709,16 +4707,16 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             chat_type=str(cb["chat_type"]) if cb["chat_type"] is not None else None,
             thread_id=str(cb["thread_id"]) if cb["thread_id"] is not None else None, user_name=cb["user_name"]):
             return True
-        await query.answer(text=denial_text)
+        await answer_callback(query, denial_text)
         return False
 
     async def _handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Dispatch inline keyboard button clicks on the callback_data prefix."""
         query = update.callback_query
-        if not query or not query.data:
+        if not query:
             return
         self._accept_update()
-        data = query.data
+        data = query.data or ""
         cb = self._callback_ctx(query)
         # Model picker / generic choice picker (/reasoning, /fast) need a chat id.
         for prefixes, handler in (
@@ -4737,6 +4735,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             if data.startswith(prefix):
                 await handler(query, data, cb)
                 return
+        logger.debug("[%s] unhandled callback query (data=%r)", self.name, data[:64])
+        await answer_callback(query)  # no handler owns it (stale build, data-less game tap): ack anyway or it spins (#78788)
 
     async def _claim_callback_state(self, query, cb: dict[str, Any], state: dict, key, denial: str, resolved: str, *, pop: bool = True):
         """Auth-gate a button tap, then claim its pending entry; None (after answering) when refused or expired."""
@@ -4744,7 +4744,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             return None
         session_key = state.pop(key, None) if pop else state.get(key)
         if not session_key:
-            await query.answer(text=resolved)
+            await answer_callback(query, resolved)
         return session_key
 
     async def _handle_exec_approval_callback(self, query, data: str, cb: dict[str, Any]) -> None:
@@ -4756,7 +4756,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         try:
             approval_id = int(parts[2])
         except (ValueError, IndexError):
-            await query.answer(text=_toast("platform.telegram.approval.toast_invalid_data"))
+            await answer_callback(query, _toast("platform.telegram.approval.toast_invalid_data"))
             return
         session_key = await self._claim_callback_state(
             query, cb, self._approval_state, approval_id, _unauthorized(),
@@ -4784,7 +4784,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         else:
             label = t("platform.telegram.approval.expired")
             edit_text = t("platform.telegram.approval.expired_detail", label=label)
-        await query.answer(text=label[:_TOAST_LIMIT])
+        await answer_callback(query, label[:_TOAST_LIMIT])
         await edit_keeping_prompt(self, query, edit_text)
         # Typing was paused when the approval was sent; the text /approve and /deny paths resume it too.
         if count and cb["chat_id"] is not None:
@@ -4806,7 +4806,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             choice, "approval.resolved_generic")
         user_display = getattr(query.from_user, "first_name", None) or t("platform.telegram.user_fallback")
         label = t(f"platform.telegram.{label_key}")
-        await query.answer(text=label[:_TOAST_LIMIT])
+        await answer_callback(query, label[:_TOAST_LIMIT])
         decided = t("platform.telegram.approval.resolved_by_user", label=label, user=user_display)
         await edit_keeping_prompt(self, query, decided)
         # The runner stored a handler keyed by session_key; run it and send any returned text as a follow-up.
@@ -4865,7 +4865,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 self._clarify_state.pop(clarify_id, None)
                 await self._notify_clarify_expired(query, user_display)
                 return
-            await query.answer(text=_toast("platform.telegram.prompt.type_answer"))
+            await answer_callback(query, _toast("platform.telegram.prompt.type_answer"))
             await self._edit_html_quiet(
                 query,
                 f"❓ {query.message.text or ''}\n\n"
@@ -4875,7 +4875,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         try:
             idx = int(choice_token)
         except (ValueError, TypeError):
-            await query.answer(text=_toast("platform.telegram.prompt.invalid_choice"))
+            await answer_callback(query, _toast("platform.telegram.prompt.invalid_choice"))
             return
         resolved_text: Optional[str] = None
         try:
@@ -4896,7 +4896,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             logger.error("[%s] resolve_gateway_clarify failed: %s", self.name, exc)
             resolved = False
         if resolved:
-            await query.answer(text=f"✓ {resolved_text[:60]}")
+            await answer_callback(query, f"✓ {resolved_text[:60]}")
             await self._edit_html_quiet(
                 query, f"❓ {_html.escape(query.message.text or '')}\n\n<b>{_html.escape(user_display)}:</b> {_html.escape(resolved_text)}")
             logger.info("Telegram clarify button resolved (id=%s, choice=%r, user=%s)", clarify_id, resolved_text, user_display)
@@ -4910,7 +4910,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         answer = data.split(":", 1)[1]  # "y" or "n"
         if not await self._callback_authorized(query, cb, _unauthorized()):
             return
-        await query.answer(text=_toast("platform.telegram.prompt.update_sent", answer=answer))
+        await answer_callback(query, _toast("platform.telegram.prompt.update_sent", answer=answer))
         word = t("platform.telegram.prompt.affirm_word" if answer == "y" else "platform.telegram.prompt.negate_word")
         await self._edit_md_quiet(query, f"☤ {t('platform.telegram.prompt.update_answered', answer=f'*{word}*')}")
         try:
@@ -4943,20 +4943,20 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         """Dispatch a gmail-triage inline-button callback (gt:verb:arg)."""
         parts = data.split(":", 2)
         if len(parts) != 3:
-            await query.answer(text=_toast("platform.telegram.gmail_triage.invalid_data"))
+            await answer_callback(query, _toast("platform.telegram.gmail_triage.invalid_data"))
             return
         verb, arg = parts[1], parts[2]
         if not await self._callback_authorized(query, cb, _unauthorized()):
             return
         entry = self._GT_VERB_DISPATCH.get(verb)
         if not entry:
-            await query.answer(text=_toast("platform.telegram.gmail_triage.unknown_verb", verb=verb))
+            await answer_callback(query, _toast("platform.telegram.gmail_triage.unknown_verb", verb=verb))
             return
         script_name, extra_args, success_key, is_state_verb = entry
         from hermes_constants import get_hermes_home
         script_path = get_hermes_home() / "scripts" / "gmail-triage" / script_name
         if not script_path.exists():
-            await query.answer(text=_toast("platform.telegram.gmail_triage.script_missing", script=script_name))
+            await answer_callback(query, _toast("platform.telegram.gmail_triage.script_missing", script=script_name))
             logger.error("[%s] gmail-triage script missing: %s", self.name, script_path)
             return
         success = False
@@ -4983,7 +4983,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         except Exception as exc:
             label = t("platform.telegram.gmail_triage.error", verb=verb, error=str(exc))
             logger.error("[%s] gmail-triage callback exception: verb=%s arg=%s err=%s", self.name, verb, arg, exc, exc_info=True)
-        await query.answer(text=label[:_TOAST_LIMIT])
+        await answer_callback(query, label[:_TOAST_LIMIT])
         if not success:
             return
         original_text = (query.message.text or "") if query.message else ""
