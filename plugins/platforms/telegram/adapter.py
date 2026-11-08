@@ -180,7 +180,7 @@ _MEDIA_KIND_KEYS = {
     "video file": "platform.telegram.media.kind_video", "video note": "platform.telegram.media.kind_video"}
 
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
-from plugins.platforms.telegram.telegram_entities import expand_link_entities
+from plugins.platforms.telegram.telegram_entities import expand_link_entities, rich_message_filter, rich_message_text
 from plugins.platforms.telegram.telegram_held_inbound import TelegramHeldInboundMixin
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id, parse_send_target, parse_telegram_message_id
 from plugins.platforms.telegram.telegram_resolved_prompt import edit_keeping_prompt
@@ -2900,7 +2900,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         """Register every PTB handler on ``app`` (initial connect and the transient-init rebuild)."""
         table = getattr(app, "handlers", None)
         core_before = {g: len(hs) for g, hs in table.items()} if isinstance(table, dict) else {}
-        app.add_handler(TelegramMessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text_message))
+        app.add_handler(TelegramMessageHandler((filters.TEXT | rich_message_filter(filters)) & ~filters.COMMAND, self._handle_text_message))
         app.add_handler(TelegramMessageHandler(filters.COMMAND, self._handle_command))
         app.add_handler(TelegramMessageHandler(
             filters.LOCATION | getattr(filters, "VENUE", filters.LOCATION), self._handle_location_message))
@@ -5989,9 +5989,14 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
 
     @staticmethod
     def _entity_sources(message: Message):
-        """``(text, entities)`` pairs for the message text and caption."""
-        yield getattr(message, "text", None) or "", getattr(message, "entities", None) or []
-        yield getattr(message, "caption", None) or "", getattr(message, "caption_entities", None) or []
+        """``(text, entities)`` pairs for the message text and caption; a text-less ``rich_message``
+        contributes its text minus code spans (as a code entity hides a handle) for the raw @handle fallback."""
+        text = getattr(message, "text", None) or ""
+        caption = getattr(message, "caption", None) or ""
+        yield text, getattr(message, "entities", None) or []
+        yield caption, getattr(message, "caption_entities", None) or []
+        if not text and not caption:
+            yield rich_message_text(message, skip_code=True), []
 
     @staticmethod
     def _entity_type(entity) -> str:
@@ -6136,7 +6141,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             return False
         return any(
             pattern.search(candidate)
-            for candidate in (getattr(message, "text", None), getattr(message, "caption", None)) if candidate
+            for candidate in (getattr(message, "text", None), getattr(message, "caption", None),
+                              rich_message_text(message)) if candidate
             for pattern in self._mention_patterns)
 
     def _is_guest_mention(self, message: Message) -> bool:
@@ -6496,9 +6502,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         return self._apply_telegram_group_observe_attribution(event)
 
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle incoming text; buffers client-split chunks into one MessageEvent."""
+        """Handle incoming text (or text-less ``rich_message`` blocks); buffers client-split chunks into one event."""
         msg = self._effective_update_message(update)
-        if not msg or not msg.text:
+        if not msg or not (msg.text or rich_message_text(msg)):
             return
         # Auth check first: blocked users must not reach batching, the observed transcript, or the agent.
         if not self._is_user_authorized_from_message(msg):
@@ -6983,60 +6989,6 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             self._dm_topics[cache_key] = int(thread_id)
             logger.info("[%s] Cached DM topic from message: %s -> thread_id=%s", self.name, cache_key, thread_id)
 
-    @classmethod
-    def _flatten_rich_inline_text(cls, value: Any) -> str:
-        """Best-effort plaintext flattener for Bot API rich-message inline nodes."""
-        if value is None:
-            return ""
-        if isinstance(value, str):
-            return value
-        if isinstance(value, list):
-            return "".join(cls._flatten_rich_inline_text(item) for item in value)
-        if isinstance(value, dict):
-            for key in ("text", "children"):
-                if value.get(key) is not None:
-                    return cls._flatten_rich_inline_text(value[key])
-        return ""
-
-    @classmethod
-    def _flatten_rich_blocks(cls, blocks: Any) -> str:
-        """Best-effort plaintext flattener for Bot API rich-message blocks."""
-        if not isinstance(blocks, list):
-            return ""
-        lines: list[str] = []
-        for block in blocks:
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") == "list":
-                for item in block.get("items", []):
-                    if not isinstance(item, dict):
-                        continue
-                    item_lines = cls._flatten_rich_blocks(item.get("blocks")).splitlines()
-                    if not item_lines:
-                        continue
-                    label = item.get("label")
-                    lines.append(f"{label} {item_lines[0]}".strip() if label else item_lines[0])
-                    lines.extend(item_lines[1:])
-                continue
-            text = cls._flatten_rich_inline_text(block.get("text"))
-            if text:
-                lines.extend(text.splitlines())
-        return "\n".join(line.rstrip() for line in lines if line)
-
-    @classmethod
-    def _extract_rich_reply_text(cls, reply_to_message: Any) -> Optional[str]:
-        """Return plaintext echoed by Telegram's rich_message reply payload."""
-        try:
-            getter = getattr(getattr(reply_to_message, "api_kwargs", None), "get", None)
-            if not callable(getter):
-                return None
-            rich_getter = getattr(getter("rich_message"), "get", None)
-            if not callable(rich_getter):
-                return None
-            return cls._flatten_rich_blocks(rich_getter("blocks")).strip() or None
-        except Exception:
-            return None
-
     def _resolve_topic_binding(self, message: Message, chat_type: str, thread_id_str: Optional[str]) -> tuple:
         """Return ``(chat_topic, topic_skill)`` for a DM topic or bound forum topic (else Nones)."""
         chat = message.chat
@@ -7091,7 +7043,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             return reply_to_id, quote_text
         reply_to_text = message.reply_to_message.text or message.reply_to_message.caption or None
         if not reply_to_text:
-            reply_to_text = self._extract_rich_reply_text(message.reply_to_message)
+            reply_to_text = rich_message_text(message.reply_to_message) or None
         if not reply_to_text:
             try:
                 from gateway import rich_sent_store

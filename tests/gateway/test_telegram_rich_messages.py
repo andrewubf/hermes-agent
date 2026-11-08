@@ -832,3 +832,62 @@ async def test_rich_reply_records_and_recovers_text(monkeypatch, tmp_path):
     )
     assert event.reply_to_message_id == "678"
     assert event.reply_to_text == "Your morning briefing: CI is green."
+
+
+def test_rich_reply_and_inbound_blocks_share_one_flattener():
+    """Replied-to rich blocks and inbound rich blocks read through ONE parser: ``children`` spans,
+    labelled list items and a ``mappingproxy`` api_kwargs all flatten the same way in both."""
+    from types import MappingProxyType
+
+    from gateway.platforms.event import MessageType
+    from plugins.platforms.telegram.telegram_entities import rich_message_text
+
+    blocks = [
+        {"type": "paragraph", "text": ["See ", {"type": "bold", "children": ["the plan"]}]},
+        {"type": "list", "items": [{"label": "1.", "blocks": [{"type": "paragraph", "text": "ship it"}]}]},
+    ]
+    msg = _reply_message_with_rich_blocks("678", blocks=blocks, api_kwargs_factory=MappingProxyType)
+
+    event = _make_adapter()._build_message_event(msg, MessageType.TEXT)
+
+    assert event.reply_to_text == "See the plan\n1. ship it"
+    assert rich_message_text(msg.reply_to_message) == event.reply_to_text
+
+
+def test_reply_to_deeply_nested_rich_message_still_reaches_the_agent():
+    """A plain reply quoting a pathologically nested rich message (valid JSON, 2,000 levels of blocks
+    and of inline spans) is still delivered: the flattener drops the over-deep content instead of
+    raising RecursionError out of ``_build_message_event``."""
+    from gateway.platforms.event import MessageType
+
+    block = {"type": "paragraph", "text": "leaf"}
+    span = "deep"
+    for _ in range(2000):
+        block = {"type": "quote", "blocks": [block]}
+        span = {"type": "bold", "children": [span]}
+    blocks = [{"type": "paragraph", "text": ["top ", {"type": "bold", "text": "line"}]}, block,
+              {"type": "paragraph", "text": span}]
+    msg = _reply_message_with_rich_blocks("678", blocks=blocks)
+
+    event = _make_adapter()._build_message_event(msg, MessageType.TEXT)
+
+    assert event.reply_to_message_id == "678"
+    assert event.reply_to_text == "top line"
+
+
+def test_rich_message_filter_leaves_media_messages_to_the_media_handler():
+    """``rich_message_filter`` (registered ahead of the media handler) claims a rich-only message but not a
+    caption-less photo that also carries ``rich_message``: that photo must still be downloaded as media."""
+    from plugins.platforms.telegram.telegram_entities import rich_message_filter
+
+    class _MessageFilter:  # PTB's MessageFilter: subclass overrides filter(message)
+        def __init__(self, name=None):
+            self.name = name
+
+    rich_filter = rich_message_filter(SimpleNamespace(MessageFilter=_MessageFilter))
+    rich = {"rich_message": {"blocks": [{"type": "paragraph", "text": "look at this"}]}}
+    photo = [SimpleNamespace(file_id="f", width=1, height=1)]
+
+    assert rich_filter.filter(SimpleNamespace(text=None, effective_attachment=None, api_kwargs=rich)) is True
+    assert rich_filter.filter(SimpleNamespace(text=None, photo=photo, effective_attachment=photo,
+                                              api_kwargs=rich)) is False

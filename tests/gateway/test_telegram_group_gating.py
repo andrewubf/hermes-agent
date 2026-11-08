@@ -1086,3 +1086,41 @@ async def test_photo_batch_addressed_to_the_bot_keeps_the_silence_notice():
     turn_ctx.reply_expected = pending["album"].reply_expected
     await runner._run_agent_deliver_first_response(turn_ctx, None, result, result, None)
     assert "silence marker" in runner._deliver_queued_first_response.await_args.args[0]
+
+
+def test_rich_message_wake_word_or_mention_in_group_is_dispatched():
+    """A text-less ``rich_message`` group message carrying the wake word or @handle is addressed to the bot: it
+    passes the trigger gate (not dropped or merely observed) and the agent gets the flattened text."""
+    adapter = _make_adapter(require_mention=True, mention_patterns=[r"\bchompy\b"],
+                            observe_unmentioned_group_messages=True)
+    msg = _group_message(None)
+    msg.api_kwargs = {"rich_message": {"blocks": [
+        {"type": "paragraph", "text": "chompy, summarise this"},
+        {"type": "paragraph", "text": "second paragraph"}]}}
+    other = _group_message(None)
+    other.api_kwargs = {"rich_message": {"blocks": [{"type": "paragraph", "text": "side chatter"}]}}
+
+    assert adapter._should_process_message(msg) is True
+    assert adapter._build_message_event(msg, MessageType.TEXT).text == "chompy, summarise this\nsecond paragraph"
+    assert adapter._should_process_message(other) is False
+    mentioned = _group_message(None)
+    mentioned.api_kwargs = {"rich_message": {"blocks": [{"type": "paragraph", "text": "@hermes_bot look"}]}}
+    assert adapter._should_process_message(mentioned) is True
+
+
+def test_rich_message_handle_inside_code_span_does_not_wake_the_bot():
+    """A rich-only group message that pastes the bot handle as ``code`` is not a mention, exactly like
+    plain text whose @handle sits under a ``code`` entity; the same handle outside code still wakes it."""
+    adapter = _make_adapter(require_mention=True)
+    plain = _group_message("run @hermes_bot to test", entities=[SimpleNamespace(type="code", offset=4, length=11)])
+    in_code = _group_message(None)
+    in_code.api_kwargs = {"rich_message": {"blocks": [
+        {"type": "paragraph", "text": ["run ", {"type": "code", "text": "@hermes_bot"}, " to test"]},
+        {"type": "pre", "text": "@hermes_bot --help"}]}}
+    outside = _group_message(None)
+    outside.api_kwargs = {"rich_message": {"blocks": [
+        {"type": "paragraph", "text": ["@hermes_bot run ", {"type": "code", "text": "make"}]}]}}
+
+    assert adapter._should_process_message(plain) is False
+    assert adapter._should_process_message(in_code) is False
+    assert adapter._should_process_message(outside) is True
