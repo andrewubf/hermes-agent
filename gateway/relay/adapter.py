@@ -28,6 +28,7 @@ from gateway.platforms.event import ProcessingOutcome
 from agent.i18n import t
 from gateway.relay.adapter_discord_interaction import RelayDiscordInteractionMixin
 from gateway.relay.descriptor import CapabilityDescriptor
+from gateway.relay.prompt_resolvers import PROMPT_RESOLVERS, may_answer_prompt
 from gateway.relay.egress import (
     EGRESS_DECLINE_CODE,
     decline_error,
@@ -69,16 +70,6 @@ _TRUTHY = {"1", "true", "yes", "on"}
 _FALSY = {"0", "false", "no", "off"}
 
 _SLACK = Platform.SLACK.value
-
-# Prompt option id -> in-channel ack label (the option set doubles as the choice allowlist).
-_EXEC_APPROVAL_LABELS = {
-    "once": "✅ Approved once",
-    "session": "✅ Approved for session",
-    "always": "✅ Approved permanently",
-    "deny": "❌ Denied",
-}
-_SLASH_CONFIRM_LABELS = {"once": "✅ Approved once", "always": "🔒 Always approve", "cancel": "❌ Cancelled"}
-
 
 def _utf16_len(text: str) -> int:
     """Count UTF-16 code units (Telegram's length unit)."""
@@ -2029,16 +2020,21 @@ class RelayAdapter(RelayDiscordInteractionMixin, BasePlatformAdapter):
                 "relay prompt_response %s (option=%s) already resolved — ignoring repeat", prompt_id, option_id
             )
             return True
+        answered_by = getattr(event.source, "user_id", None)
+        if not may_answer_prompt(self._pending_prompts.get(prompt_id) or {}, answered_by, option_id):
+            logger.info("relay prompt_response %s refused for %s by its slash policy", prompt_id, answered_by)
+            return True  # consumed, but the prompt stays live for someone allowed
         state = self._pop_prompt(prompt_id)
         if state is None:
             logger.info("relay prompt_response for unknown/expired prompt %s (option=%s)", prompt_id, option_id)
             await self._notify_prompt_expired(event)
             return True
         self._note_prompt_resolved(prompt_id)
+        state["answered_by"] = answered_by
 
         kind = state.get("kind")
         chat_id = str(state.get("chat_id") or getattr(event.source, "chat_id", ""))
-        handler = _PROMPT_RESOLVERS.get(kind)
+        handler = PROMPT_RESOLVERS.get(kind)
         try:
             if handler is None:
                 logger.warning("relay prompt_response with unknown kind %r", kind)
@@ -2049,48 +2045,6 @@ class RelayAdapter(RelayDiscordInteractionMixin, BasePlatformAdapter):
         except Exception:
             logger.warning("relay prompt_response resolution failed", exc_info=True)
         return True
-
-    async def _resolve_exec_approval(self, state, option_id, chat_id, ack_meta) -> None:
-        from tools.approval import resolve_gateway_approval_card
-        choice = option_id if option_id in _EXEC_APPROVAL_LABELS else "deny"
-        count = resolve_gateway_approval_card(str(state.get("session_key") or ""), choice, state.get("request_id"))
-        label = _EXEC_APPROVAL_LABELS[choice] if count else "⌛ Approval expired — no command was waiting."
-        # In-channel ack preserves the audit trail the native edit gives (the
-        # connector's prompt message can't be edited cross-platform yet).
-        self._send_lifecycle_ack(chat_id, label, ack_meta)
-        if count:
-            self.resume_typing_for_chat(chat_id)
-
-    async def _resolve_slash_confirm(self, state, option_id, chat_id, ack_meta) -> None:
-        from tools import slash_confirm as slash_confirm_mod
-
-        choice = option_id if option_id in _SLASH_CONFIRM_LABELS else "cancel"
-        result_text = await slash_confirm_mod.resolve(
-            str(state.get("session_key") or ""), str(state.get("confirm_id") or ""), choice
-        )
-        self._send_lifecycle_ack(chat_id, _SLASH_CONFIRM_LABELS[choice], ack_meta)
-        if result_text:
-            self._send_lifecycle_ack(chat_id, str(result_text), ack_meta)
-
-    async def _resolve_clarify(self, state, option_id, chat_id, ack_meta) -> None:
-        from tools.clarify_gateway import mark_awaiting_text, resolve_gateway_clarify
-
-        clarify_id = str(state.get("clarify_id") or "")
-        if option_id == "other":
-            mark_awaiting_text(clarify_id)
-            self._send_lifecycle_ack(chat_id, "✏️ Type your answer:", ack_meta)
-            return
-        choices = state.get("choices") or []
-        try:
-            idx = int(option_id[1:]) if option_id.startswith("c") else -1
-        except ValueError:
-            idx = -1
-        if 0 <= idx < len(choices):
-            resolve_gateway_clarify(clarify_id, str(choices[idx]))
-            self._send_lifecycle_ack(chat_id, f"✅ {choices[idx]}", ack_meta)
-        else:
-            # Unmappable option: flip to text capture (never dead-end a clarify).
-            mark_awaiting_text(clarify_id)
 
     def _send_lifecycle_ack(self, chat_id: str, text: str, metadata: dict[str, Any]) -> None:
         """Fire-and-forget a prompt-lifecycle ack from read-loop context.
@@ -2295,11 +2249,3 @@ class RelayAdapter(RelayDiscordInteractionMixin, BasePlatformAdapter):
             platform=self._platform_by_chat.get(chat_id) or self._platform_by_chat.get(str(thread_id)),
         )
         return result is not None
-
-
-# prompt kind -> resolver (order-independent: kinds are distinct keys).
-_PROMPT_RESOLVERS = {
-    "exec_approval": RelayAdapter._resolve_exec_approval,
-    "slash_confirm": RelayAdapter._resolve_slash_confirm,
-    "clarify": RelayAdapter._resolve_clarify,
-}

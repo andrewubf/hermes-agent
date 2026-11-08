@@ -5575,19 +5575,24 @@ class SlackAdapter(BasePlatformAdapter):
         started = await self._begin_interaction(ack, body, action, "slash-confirm")
         if started is None:
             return
-        team_id, action_id, value, message, msg_ts, channel_id, user_name, _user_id = started
+        team_id, action_id, value, message, msg_ts, channel_id, user_name, user_id = started
         if "|" not in value:
             logger.warning("[Slack] Malformed slash-confirm value: %s", value)
             return
         session_key, confirm_id = value.split("|", 1)
+        from tools import slash_confirm as _slash_confirm_mod
+        # Answering runs the confirmed command: a clicker its slash policy refuses is ignored like
+        # any unauthorized click, and the prompt stays live for someone allowed.
+        if not _slash_confirm_mod.can_answer(session_key, user_id):
+            logger.warning("[Slack] slash-confirm click by %s (%s) refused by slash policy", user_name, user_id)
+            return
         choice = self._CONFIRM_CHOICES.get(action_id, "cancel")
         decision_text = t(self._CONFIRM_DECISION_KEYS[choice], user=user_name)
         await self._finalize_interactive_message(
             channel_id, msg_ts, self._section_text(message), decision_text,
             "Confirmation prompt", "slash-confirm", team_id or None)
         try:
-            from tools import slash_confirm as _slash_confirm_mod
-            result_text = await _slash_confirm_mod.resolve(session_key, confirm_id, choice)
+            result_text = await _slash_confirm_mod.resolve(session_key, confirm_id, choice, user_id=user_id)
             if result_text:
                 post_kwargs: dict[str, Any] = {"channel": channel_id, "text": result_text}
                 thread_ts = message.get("thread_ts") or msg_ts  # stay in the same thread
@@ -5618,8 +5623,14 @@ class SlackAdapter(BasePlatformAdapter):
         started = await self._begin_interaction(ack, body, action, "approval")
         if started is None:
             return
-        team_id, action_id, session_key, message, msg_ts, channel_id, user_name, _user_id = started
+        team_id, action_id, session_key, message, msg_ts, channel_id, user_name, user_id = started
         choice = self._APPROVAL_CHOICES.get(action_id, "deny")
+        from tools.approval import gateway_approval_refusal
+        # A click is /approve or /deny: a clicker the chat's slash policy refuses is ignored like any
+        # unauthorized click, and the card stays live for someone allowed.
+        if gateway_approval_refusal(session_key, user_id, choice):
+            logger.warning("[Slack] approval click by %s (%s) refused by slash policy", user_name, user_id)
+            return
         # Double-click guard (atomic pop). Also accept the bare ts: the approval may
         # have been stored without a team id while the click carries one.
         approval_key = self._workspace_message_marker(team_id, msg_ts)

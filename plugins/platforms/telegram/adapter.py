@@ -4758,6 +4758,14 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         except (ValueError, IndexError):
             await query.answer(text=_toast("platform.telegram.approval.toast_invalid_data"))
             return
+        from tools.approval import gateway_approval_refusal
+        # A tap is /approve or /deny: a clicker the chat's slash policy refuses gets its refusal and
+        # the card stays live for someone allowed.
+        pending_key = self._approval_state.get(approval_id)
+        refusal = pending_key and gateway_approval_refusal(pending_key, getattr(query.from_user, "id", None), choice)
+        if refusal:
+            await query.answer(text=refusal[:_TOAST_LIMIT], show_alert=True)
+            return
         session_key = await self._claim_callback_state(
             query, cb, self._approval_state, approval_id, _unauthorized(),
             _toast("platform.telegram.approval.toast_already_resolved"))
@@ -4797,6 +4805,14 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             return
         choice = parts[1]  # once, always, cancel
         confirm_id = parts[2]
+        from tools import slash_confirm as _slash_confirm_mod
+        user_id = str(getattr(query.from_user, "id", ""))
+        # Answering runs the confirmed command: a clicker its slash policy refuses gets the
+        # unauthorized toast and the prompt stays live for someone allowed.
+        pending_key = self._slash_confirm_state.get(confirm_id)
+        if pending_key and not _slash_confirm_mod.can_answer(pending_key, user_id):
+            await query.answer(text=_unauthorized())
+            return
         session_key = await self._claim_callback_state(
             query, cb, self._slash_confirm_state, confirm_id, _unauthorized(),
             _toast("platform.telegram.slash_confirm.already_resolved"))
@@ -4811,8 +4827,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         await edit_keeping_prompt(self, query, decided)
         # The runner stored a handler keyed by session_key; run it and send any returned text as a follow-up.
         try:
-            from tools import slash_confirm as _slash_confirm_mod
-            result_text = await _slash_confirm_mod.resolve(session_key, confirm_id, choice)
+            result_text = await _slash_confirm_mod.resolve(session_key, confirm_id, choice, user_id=user_id)
             if result_text and query.message:
                 # Inherit the prompt's topic: forums use message_thread_id; private DM-topic lanes need
                 # both the topic id and the prompt reply anchor.

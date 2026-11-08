@@ -123,13 +123,36 @@ def _denial_breaker_addendum(session_key: str) -> str:
 # instead of only hearing "denied". Ported from qwibitai/nanoclaw#2832.
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+_gateway_answer_gates: dict[str, object] = {}  # session_key → callable(user_id, verb) -> refusal | None
 
 
-def register_gateway_notify(session_key: str, cb) -> None:
+def register_gateway_notify(session_key: str, cb, *, may_answer=None) -> None:
     """Register ``cb(approval_data: dict) -> None`` for sending approval requests. The callback
-    bridges sync→async: it runs in the agent thread and must schedule the send on the loop."""
+    bridges sync→async: it runs in the agent thread and must schedule the send on the loop.
+
+    ``may_answer(user_id, verb)`` (``verb`` is ``"approve"`` or ``"deny"``) is the chat's slash
+    policy for answering, returning the refusal text or ``None``: a native button or reaction is the
+    same answer as ``/approve``, so every chat surface asks :func:`gateway_approval_refusal` before
+    resolving. Host surfaces (API server, TUI) register none and stay unrestricted."""
     with _lock:
         _gateway_notify_cbs[session_key] = cb
+        if may_answer is None:
+            _gateway_answer_gates.pop(session_key, None)
+        else:
+            _gateway_answer_gates[session_key] = may_answer
+
+
+def gateway_approval_refusal(session_key: str, user_id, choice: str) -> Optional[str]:
+    """The refusal to show when chat user ``user_id`` may not answer ``session_key``'s pending
+    approval with ``choice`` (the ``/approve is admin-only here`` text), else ``None``.
+
+    ``None`` when the session registered no gate (ungated chat, host surface). Callers check before
+    claiming the button/reaction, so a refused answer leaves the prompt live for someone allowed."""
+    with _lock:
+        gate = _gateway_answer_gates.get(session_key)
+    if gate is None:
+        return None
+    return gate(str(user_id or "") or None, "deny" if choice == "deny" else "approve")
 
 
 def unregister_gateway_notify(session_key: str) -> None:
@@ -137,6 +160,7 @@ def unregister_gateway_notify(session_key: str) -> None:
     they don't hang forever (agent run finished or interrupted)."""
     with _lock:
         _gateway_notify_cbs.pop(session_key, None)
+        _gateway_answer_gates.pop(session_key, None)
         for entry in _gateway_queues.pop(session_key, []):
             entry.event.set()
 

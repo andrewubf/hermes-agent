@@ -2374,6 +2374,13 @@ class FeishuAdapter(FeishuChoiceCardsMixin, BasePlatformAdapter):
         user_id: str = "", union_id: str = "",
     ) -> None:
         """Pop approval state and unblock the waiting agent thread."""
+        from tools.approval import gateway_approval_refusal
+        # A click is /approve or /deny: a clicker the chat's slash policy refuses leaves the card live
+        # for someone allowed. ``user_id or open_id`` is the inbound ``SessionSource.user_id``.
+        pending = self._approval_state.get(approval_id) or {}
+        if pending and gateway_approval_refusal(pending.get("session_key", ""), user_id or open_id, choice):
+            logger.warning("[Feishu] approval click by %s refused by slash policy", open_id or user_id)
+            return
         state = self._pop_validated_prompt_state(
             states=self._approval_state, ident=approval_id, label="Approval", open_id=open_id, chat_id=chat_id,
             unauthorized_fmt="[Feishu] Unauthorized approval click by %s for approval %s",

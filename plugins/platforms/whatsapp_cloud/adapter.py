@@ -925,6 +925,14 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
     async def _handle_approval_tap(self, to: str, inner: dict[str, Any], parts: list) -> bool:
         _, approval_id, choice = parts
+        approval = _optional_module("tools.approval", "[whatsapp_cloud] approval resolver unavailable")
+        # A tap is /approve or /deny: a tapper (``to``, DMs only) the slash policy refuses leaves it live.
+        pending_key = self._exec_approval_state.get(approval_id)
+        refusal = approval is not None and pending_key and approval.gateway_approval_refusal(pending_key, to, choice)
+        if refusal:
+            logger.warning("[whatsapp_cloud] approval tap by %s refused by slash policy", to)
+            await self._reply_best_effort(to, refusal, "[whatsapp_cloud] approval refusal reply failed")
+            return True
         session_key = self._pop_tap_state(
             self._exec_approval_state, approval_id,
             "[whatsapp_cloud] approval tap with no matching state (approval_id=%s) — likely stale; falling back to text",
@@ -933,7 +941,6 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if not session_key:
             return False
         request_id = self._approval_request_ids().pop(approval_id, None)
-        approval = _optional_module("tools.approval", "[whatsapp_cloud] approval resolver unavailable")
         if approval is None:
             return False
         count = approval.resolve_gateway_approval_card(session_key, choice, request_id)
@@ -960,7 +967,8 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if slash_confirm is None:
             return False
         try:
-            result_text = await slash_confirm.resolve(session_key, confirm_id, choice)
+            # ``to`` is the tapping user (DMs only), whom the confirm's slash policy checks.
+            result_text = await slash_confirm.resolve(session_key, confirm_id, choice, user_id=to)
         except Exception:
             logger.exception("[whatsapp_cloud] slash_confirm.resolve failed")
             return True  # still claim the tap; surfacing it as text wouldn't help

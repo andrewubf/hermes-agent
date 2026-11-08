@@ -705,6 +705,13 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 logger.debug("resume_typing_for_chat after clarify answer failed", exc_info=True)
         return response, answered
 
+    def _approval_answer_refusal(self, user_id: Optional[str], verb: str) -> Optional[str]:
+        """A button or reaction answer is ``/approve`` / ``/deny``: the clicker must pass the same
+        slash policy in this chat (``allow_admin_from`` / ``user_allowed_commands``). Returns the
+        slash gate's refusal text, or None when allowed."""
+        from gateway.session_identity import replace_source
+        return self._runner._check_slash_access(replace_source(self._ctx.source, user_id=user_id), verb)
+
     def _approval_notify_sync(self, approval_data: dict) -> None:
         if self._approval_owner is not None:
             authority, session_id, generation = self._approval_owner
@@ -983,7 +990,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         ctx = self._ctx
         session_key = ctx.session_key or ""
         token = set_current_session_key(session_key)
-        register_gateway_notify(session_key, self._approval_notify_sync)
+        register_gateway_notify(session_key, self._approval_notify_sync, may_answer=self._approval_answer_refusal)
         try:
             api_message = _wrap_current_message_with_observed_context(self._native_image_run_message(), observed_group_context)
             kwargs = {"conversation_history": agent_history, "task_id": ctx.session_id}

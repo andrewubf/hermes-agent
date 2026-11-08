@@ -694,7 +694,10 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             if choice is None:
                 logger.warning("[%s] Unknown approval decision %r (session=%s)", self._log_tag, decision, session_key)
                 return
-            if not self._is_authorized_interaction_for_session(event, session_key):
+            from tools.approval import gateway_approval_refusal
+            # A click is /approve or /deny, so it also takes the chat's slash policy.
+            if not self._is_authorized_interaction_for_session(event, session_key) or (
+                    gateway_approval_refusal(session_key, event.operator_openid, choice)):
                 logger.warning(
                     "[%s] Rejected unauthorized approval click for session %s (operator=%s)",
                     self._log_tag, session_key, event.operator_openid)
