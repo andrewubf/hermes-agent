@@ -1,0 +1,17 @@
+name: weft
+title: Weft — edit-time coordination
+repo: https://github.com/celador/weft
+sha: fe30e497b924fb22aa95a67c0d81d938fab94fc4
+subdir: packages/adapters/hermes/plugin/weft
+description: Catch conflicts between coding agents while they edit, before Git merge time.
+maintainer: celador
+tier: community
+category: tools
+requires_hermes: ">=0.22.5"
+version: "0.4.0"
+platforms: [linux, macos]
+readme: true
+docs_url: https://github.com/celador/weft/blob/fe30e497b924fb22aa95a67c0d81d938fab94fc4/packages/adapters/hermes/plugin/weft/README.md
+screenshots:
+  - https://raw.githubusercontent.com/celador/weft/fe30e497b924fb22aa95a67c0d81d938fab94fc4/docs/hackathon/screenshots/weft-conflict.png
+  - https://raw.githubusercontent.com/celador/weft/fe30e497b924fb22aa95a67c0d81d938fab94fc4/docs/hackathon/screenshots/weft-empty.png
