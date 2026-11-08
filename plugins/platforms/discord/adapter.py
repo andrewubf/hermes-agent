@@ -182,6 +182,11 @@ _AUTOCOMPLETE_PROVIDERS = {"models": "_autocomplete_model"}
 # /model autocomplete: the catalog read fires on every keystroke, so memoise it briefly.
 _MODEL_AUTOCOMPLETE_CACHE_TTL = 120.0
 _MODEL_AUTOCOMPLETE_MAX_MODELS = 1000
+# Discord kills an autocomplete interaction 3s after the keystroke, and the response still has to
+# travel back inside that window. `non_blocking_catalogs` alone does NOT bound the catalog read —
+# a live custom-endpoint probe keeps its own 5s budget (`probe_custom_providers`) — so the read is
+# capped here and an over-budget keystroke answers empty instead of killing the interaction.
+_MODEL_AUTOCOMPLETE_DEADLINE = 2.0
 
 
 def _default_voice_ack_phrases() -> list:
@@ -4598,9 +4603,12 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         """Build (and briefly cache) the flat model list for ``/model`` autocomplete.
 
         Returns ``(label, value)`` tuples where *value* is the argument string handed to
-        ``/model``: a bare model id for the current provider, or ``"<id> --provider <slug>"``
-        for the others. Sourced from the same authenticated-provider catalog the interactive
-        picker reads, so the two cannot disagree.
+        ``/model``: always ``"<id> --provider <slug>"``, never a bare model id. A bare id is
+        resolved against whatever the session currently routes to — the routed profile's
+        config, a channel override, or a live ``/model`` session override — none of which this
+        read sees, so the same suggestion could land on a different provider than its label
+        advertises. Pinning the provider makes the value self-describing. Sourced from the same
+        authenticated-provider catalog the interactive picker reads.
 
         The read comes from the provider-model cache, but autocomplete fires on every
         keystroke, so the result is memoised briefly.
@@ -4611,6 +4619,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         if cached is not None and (now - cached_at) < _MODEL_AUTOCOMPLETE_CACHE_TTL:
             return cached
         entries: "list[tuple[str, str]]" = []
+        rebuilt = False
         try:
             from gateway.run import _load_gateway_config
             from hermes_cli.model_switch_providers import list_authenticated_providers
@@ -4633,10 +4642,14 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                 user_providers=cfg.get("providers") or {},
                 custom_providers=custom_provs,
                 max_models=_MODEL_AUTOCOMPLETE_MAX_MODELS,
-                # Discord kills an autocomplete response after 3s, so never block a
-                # keystroke on a catalog probe: serve what is cached and let stale
-                # catalogs warm up in the background (same list, ~4x faster).
+                # Autocomplete must never block on a live probe: `non_blocking_catalogs` covers
+                # the provider catalogs but explicitly NOT custom-endpoint discovery, which
+                # keeps its own 5s budget. A cold, unreachable custom endpoint measured ~10s
+                # through this call — three times Discord's whole budget. Declared `models:`
+                # lists still come through; only the live `/models` probe is dropped.
                 non_blocking_catalogs=True,
+                probe_custom_providers=False,
+                refresh=False,
             )
             providers = sorted(
                 providers,
@@ -4646,7 +4659,6 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             for p in providers:
                 slug = str(p.get("slug", "") or "")
                 pname = str(p.get("name", "") or slug)
-                is_current = slug.lower() == cur_provider.lower()
                 for mid in p.get("models", []) or []:
                     mid = str(mid)
                     if not mid or (mid, slug) in seen:
@@ -4654,12 +4666,16 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                     seen.add((mid, slug))
                     entries.append((
                         f"{mid} · {pname}",
-                        mid if is_current else f"{mid} --provider {slug}",
+                        f"{mid} --provider {slug}" if slug else mid,
                     ))
+            rebuilt = True
         except Exception:
             entries = cached or []
         self._model_entries_cache = entries
-        self._model_entries_cache_at = now
+        # A failed rebuild must not renew the TTL: stamping `now` on the error path pinned an
+        # empty (or stale) list for a full interval, so a recovered catalog stayed invisible.
+        if rebuilt:
+            self._model_entries_cache_at = now
         return entries
 
     async def _autocomplete_model(
@@ -4677,8 +4693,14 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         if not allowed:
             return []
         try:
-            entries = await asyncio.to_thread(self._model_autocomplete_entries)
+            entries = await asyncio.wait_for(
+                asyncio.to_thread(self._model_autocomplete_entries),
+                timeout=_MODEL_AUTOCOMPLETE_DEADLINE,
+            )
         except Exception:
+            # Over budget (or the catalog read blew up): answer empty. `to_thread` keeps the
+            # event loop free but does not bound elapsed time, and Discord treats a late or
+            # failed autocomplete response as a dead interaction.
             return []
         needle = (current or "").strip().lower()
         choices: list = []

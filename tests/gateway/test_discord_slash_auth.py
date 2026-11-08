@@ -674,8 +674,10 @@ async def test_model_autocomplete_filters_caps_and_skips_overlong_values(
     is a different, invalid model id. Labels may be clipped — cosmetic only."""
     adapter._allowed_user_ids = {"999999999"}
     overlong = "m" * 101
-    entries = [(f"model-{i:02d} · Atlas", f"model-{i:02d}") for i in range(40)]
-    entries.append((overlong, overlong))
+    # First, not last: with 40 entries ahead of it the 25-choice cap would hide the
+    # overlong item whether it was skipped or truncated, and the test would pass either way.
+    entries = [(overlong, overlong)]
+    entries.extend((f"model-{i:02d} · Atlas", f"model-{i:02d} --provider atlas") for i in range(40))
     entries.append(("x" * 200, "short-value"))
     monkeypatch.setattr(adapter, "_model_autocomplete_entries", lambda: entries)
 
@@ -685,8 +687,12 @@ async def test_model_autocomplete_filters_caps_and_skips_overlong_values(
     assert all(len(choice.value) <= 100 for choice in choices)
     assert all(overlong not in choice.value for choice in choices)
 
+    # Querying the overlong id directly proves it was skipped, not clipped: a truncated
+    # value would still match the needle and come back as a 100-char prefix.
+    assert await adapter._autocomplete_model(interaction, overlong) == []
+
     filtered = await adapter._autocomplete_model(interaction, "model-07")
-    assert [choice.value for choice in filtered] == ["model-07"]
+    assert [choice.value for choice in filtered] == ["model-07 --provider atlas"]
 
     long_label = await adapter._autocomplete_model(interaction, "x" * 200)
     assert [choice.value for choice in long_label] == ["short-value"]
@@ -696,8 +702,11 @@ async def test_model_autocomplete_filters_caps_and_skips_overlong_values(
 def test_model_autocomplete_entries_round_trip_through_the_model_argument(
     adapter, monkeypatch,
 ):
-    """A value must be exactly what ``/model`` accepts: a bare model id for the
-    current provider, ``<id> --provider <slug>`` for every other one."""
+    """Every value pins its provider: ``<id> --provider <slug>``, never a bare id.
+
+    A bare id resolves against whatever the session routes to — the routed profile's config,
+    a channel override, or a live ``/model`` session override — none of which this read sees.
+    The suggestion would then select a provider its own label does not name."""
     import sys
     import types
 
@@ -712,18 +721,96 @@ def test_model_autocomplete_entries_round_trip_through_the_model_argument(
     fake_cp.get_compatible_custom_providers = lambda cfg: []
     monkeypatch.setitem(sys.modules, "hermes_cli.config_providers", fake_cp)
 
+    seen_kwargs: dict = {}
+
+    def fake_list(**kwargs):
+        seen_kwargs.update(kwargs)
+        return [
+            {"slug": "openrouter", "name": "OpenRouter", "models": ["gpt-5"]},
+            {"slug": "atlas", "name": "Atlas Cloud", "models": ["gpt-5"]},
+        ]
+
     fake_msp = types.ModuleType("hermes_cli.model_switch_providers")
-    fake_msp.list_authenticated_providers = lambda **kwargs: [
-        {"slug": "openrouter", "name": "OpenRouter", "models": ["gpt-5"]},
-        {"slug": "atlas", "name": "Atlas Cloud", "models": ["gpt-5"]},
-    ]
+    fake_msp.list_authenticated_providers = fake_list
     monkeypatch.setitem(sys.modules, "hermes_cli.model_switch_providers", fake_msp)
 
     entries = adapter._model_autocomplete_entries()
     values = {value: label for label, value in entries}
 
-    assert values["gpt-5"] == "gpt-5 · Atlas Cloud"  # current provider keeps a bare id
+    # The current provider is pinned too — a bare id is what lets the session route win.
+    assert values["gpt-5 --provider atlas"] == "gpt-5 · Atlas Cloud"
     assert values["gpt-5 --provider openrouter"] == "gpt-5 · OpenRouter"
     assert len(entries) == 2  # the same id on two providers stays distinct
+    assert not any("--provider" not in value for _label, value in entries)
+
+    # No live custom-endpoint probe: it keeps its own 5s budget regardless of
+    # `non_blocking_catalogs`, which is longer than the whole autocomplete window.
+    assert seen_kwargs["non_blocking_catalogs"] is True
+    assert seen_kwargs["probe_custom_providers"] is False
+    assert seen_kwargs["refresh"] is False
+
+
+@pytest.mark.asyncio
+async def test_model_autocomplete_deadline_bounds_a_slow_catalog(adapter, monkeypatch):
+    """An over-budget catalog read answers empty instead of killing the interaction.
+
+    Discord gives autocomplete 3s end-to-end; `asyncio.to_thread` bounds neither, so the
+    callback caps the wait and returns nothing rather than a late response."""
+    import time as _time
+
+    adapter._allowed_user_ids = {"999999999"}
+
+    def slow_entries():
+        _time.sleep(3)
+        return [("gpt-5 · Atlas", "gpt-5 --provider atlas")]
+
+    monkeypatch.setattr(adapter, "_model_autocomplete_entries", slow_entries)
+    monkeypatch.setattr(
+        "plugins.platforms.discord.adapter._MODEL_AUTOCOMPLETE_DEADLINE", 0.2, raising=False,
+    )
+
+    started = _time.monotonic()
+    choices = await adapter._autocomplete_model(_make_interaction("999999999"), "")
+    elapsed = _time.monotonic() - started
+
+    assert choices == []
+    assert elapsed < 2.0  # bounded by the deadline, not by the 10s read
+
+
+def test_model_autocomplete_failed_rebuild_does_not_pin_an_empty_list(
+    adapter, monkeypatch,
+):
+    """A failed catalog read must not renew the TTL.
+
+    Stamping the cache timestamp on the error path pinned the empty list for the whole
+    120s interval, so a catalog that recovered meanwhile stayed invisible."""
+    import sys
+    import types
+
+    fake_run = types.ModuleType("gateway.run")
+    fake_run._load_gateway_config = lambda: {"model": {"provider": "atlas"}}
+    monkeypatch.setitem(sys.modules, "gateway.run", fake_run)
+
+    fake_cp = types.ModuleType("hermes_cli.config_providers")
+    fake_cp.get_compatible_custom_providers = lambda cfg: []
+    monkeypatch.setitem(sys.modules, "hermes_cli.config_providers", fake_cp)
+
+    state = {"fail": True}
+
+    def fake_list(**_kwargs):
+        if state["fail"]:
+            raise RuntimeError("catalog unavailable")
+        return [{"slug": "atlas", "name": "Atlas Cloud", "models": ["gpt-5"]}]
+
+    fake_msp = types.ModuleType("hermes_cli.model_switch_providers")
+    fake_msp.list_authenticated_providers = fake_list
+    monkeypatch.setitem(sys.modules, "hermes_cli.model_switch_providers", fake_msp)
+
+    assert adapter._model_autocomplete_entries() == []
+    assert getattr(adapter, "_model_entries_cache_at", 0.0) == 0.0
+
+    state["fail"] = False
+    entries = adapter._model_autocomplete_entries()
+    assert entries == [("gpt-5 · Atlas Cloud", "gpt-5 --provider atlas")]
 
 
