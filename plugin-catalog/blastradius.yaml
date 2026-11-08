@@ -1,0 +1,20 @@
+name: blastradius
+repo: https://github.com/valenciayuna/hermes-plugin-blastradius
+sha: 6d826cdaa6d773bac968239e94d387146a1b9ae8
+description: Measures what a destructive shell command will delete before it runs, splits the count into files git can restore and files it cannot, then copies the target into a checksummed snapshot so the damage can be undone and verified.
+maintainer: valenciayuna
+tier: community
+docs_url: https://github.com/valenciayuna/hermes-plugin-blastradius
+platforms: []
+capabilities:
+  provides_tools:
+  - blast_radius
+  - blast_allow
+  - blast_snapshot
+  - blast_snapshots
+  - blast_restore
+  - blast_policy
+  provides_hooks:
+  - pre_tool_call
+  provides_middleware: []
+  requires_env: []
